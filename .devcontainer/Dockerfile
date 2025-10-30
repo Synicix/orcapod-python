@@ -26,14 +26,14 @@ RUN \
 USER vscode
 ENV PATH=/home/vscode/.local/bin:$PATH
 WORKDIR /home/vscode
-COPY --chown=vscode:nogroup src/orcapod/requirements.txt /tmp/requirements.txt
+COPY --chown=vscode:nogroup ./pyproject.toml /tmp/pyproject.toml
 RUN \
     # python setup
     curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    uv venv -p 3.9 ~/.local/share/base && \
+    uv venv -p 3.11 ~/.local/share/base && \
     uv pip install --no-cache-dir --upgrade pip flake8 black faker ipykernel -p ~/.local/share/base && \
-    uv pip install --no-cache-dir -r /tmp/requirements.txt -p ~/.local/share/base && \
-    rm /tmp/requirements.txt && \
+    uv pip install -p ~/.local/share/base -r /tmp/pyproject.toml && \
+    rm /tmp/pyproject.toml && \ 
     echo '. ~/.local/share/base/bin/activate' >> ~/.bashrc
 ENV VIRTUAL_ENV=/home/vscode/.local/share/base
 
