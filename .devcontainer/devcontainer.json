@@ -7,7 +7,8 @@
 	"overrideCommand": false,
 	"workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
 	"mounts": [
-		"source=${localWorkspaceFolderBasename}_devcontainer_docker_data,target=/var/lib/docker,type=volume"
+		"source=${localWorkspaceFolderBasename}_devcontainer_docker_data,target=/var/lib/docker,type=volume",
+		"source=claude_code_settings,target=/home/vscode/.claude,type=volume"
 	],
 	"remoteEnv": {
 		"LOCAL_WORKSPACE_FOLDER": "${localWorkspaceFolder}"
@@ -32,7 +33,8 @@
 				"eamodio.gitlens", // Git explorer in VSCode
 				"streetsidesoftware.code-spell-checker", // Catch spelling errors in docs
 				"GitHub.copilot-chat", // GitHub Copilot AI assistant
-				"ms-python.python", // Python IDE
+				"anthropic.claude-code", // Claude Code AI assistant
+				"ms-python.python" // Python IDE
 			]
 		}
 	},
