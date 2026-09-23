@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import orcapod.contexts as contexts
-from orcapod.config import DEFAULT_CONFIG, Config
+from orcapod.config import DEFAULT_CONFIG, OrcapodConfig
 from orcapod.types import ContentHash
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ class DataContextMixin:
     def __init__(
         self,
         data_context: str | contexts.DataContext | None = None,
-        config: Config | None = None,
+        config: OrcapodConfig | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -85,7 +85,7 @@ class DataContextMixin:
         self._orcapod_config = config
 
     @property
-    def orcapod_config(self) -> Config:
+    def orcapod_config(self) -> OrcapodConfig:
         return self._orcapod_config
 
     @property
@@ -117,7 +117,7 @@ class ContentIdentifiableBase(DataContextMixin, ABC):
     def __init__(
         self,
         data_context: str | contexts.DataContext | None = None,
-        config: Config | None = None,
+        config: OrcapodConfig | None = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -201,6 +201,17 @@ class ContentIdentifiableBase(DataContextMixin, ABC):
 
         return self.identity_structure() == other.identity_structure()
 
+    def _invalidate_content_hash_cache(self) -> None:
+        """Invalidate the cached content hash.
+
+        Call this after any mutation that changes the object's semantic
+        content so that the next call to ``content_hash()`` recomputes
+        from scratch.  Subclasses must use this method rather than
+        accessing ``_content_hash_cache`` directly.
+        """
+        self._content_hash_cache.clear()
+        self._cached_int_hash = None
+
 
 class PipelineElementBase(DataContextMixin, ABC):
     """
@@ -269,6 +280,15 @@ class PipelineElementBase(DataContextMixin, ABC):
                 self.pipeline_identity_structure(), resolver=pipeline_resolver
             )
         return self._pipeline_hash_cache[cache_key]
+
+    def _invalidate_pipeline_hash_cache(self) -> None:
+        """Invalidate the cached pipeline hash.
+
+        Call this after any structural mutation (e.g. attaching a database)
+        that changes this element's pipeline identity.  Subclasses must use
+        this method rather than accessing ``_pipeline_hash_cache`` directly.
+        """
+        self._pipeline_hash_cache.clear()
 
 
 class TemporalMixin:
@@ -340,7 +360,7 @@ class TraceableBase(
         self,
         label: str | None = None,
         data_context: str | contexts.DataContext | None = None,
-        config: Config | None = None,
+        config: OrcapodConfig | None = None,
     ):
         # Init provided here for explicit listing of parmeters
         super().__init__(label=label, data_context=data_context, config=config)

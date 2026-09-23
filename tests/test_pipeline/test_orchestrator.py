@@ -24,14 +24,19 @@ import pytest
 
 from orcapod.channels import Channel
 from orcapod.core.function_pod import FunctionPod
-from orcapod.core.nodes import FunctionNode, OperatorNode, SourceNode
+from orcapod.core.nodes.function_node import FunctionJobNode
+from orcapod.core.nodes.operator_node import OperatorJobNode
+from orcapod.core.nodes.source_node import SourceJobNode
 from orcapod.core.operators import SelectDataColumns
 from orcapod.core.operators.join import Join
 from orcapod.core.operators.mappers import MapData
 from orcapod.core.data_function import PythonDataFunction
 from orcapod.core.sources import ArrowTableSource
 from orcapod.databases import InMemoryArrowDatabase
-from orcapod.pipeline import AsyncPipelineOrchestrator, Pipeline
+from orcapod.pipeline import AsyncPipelineOrchestrator
+from orcapod.pipeline.dag import OrcaDAG
+from orcapod.pipeline.job import PipelineJob
+from orcapod.pipeline.observer import NoOpObserver
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,10 +77,19 @@ def add_values(value: int, score: int) -> int:
 
 
 class TestSourceNodeAsyncExecute:
+    def _make_job_node(self, src):
+        tag_schema, data_schema = src.output_schema()
+        return SourceJobNode(
+            name="test_src",
+            tag_schema=tag_schema,
+            data_schema=data_schema,
+            bound_source=src,
+        )
+
     @pytest.mark.asyncio
     async def test_pushes_all_rows_to_output(self):
         src = _make_source("key", "value", {"key": ["a", "b", "c"], "value": [1, 2, 3]})
-        node = SourceNode(src)
+        node = self._make_job_node(src)
 
         output_ch = Channel(buffer_size=16)
         await node.async_execute(output_ch.writer)
@@ -86,7 +100,7 @@ class TestSourceNodeAsyncExecute:
     @pytest.mark.asyncio
     async def test_closes_channel_on_completion(self):
         src = _make_source("key", "value", {"key": ["a"], "value": [1]})
-        node = SourceNode(src)
+        node = self._make_job_node(src)
 
         output_ch = Channel(buffer_size=4)
         await node.async_execute(output_ch.writer)
@@ -105,7 +119,7 @@ class TestOperatorNodeAsyncExecute:
     async def test_delegates_to_operator(self):
         src = _make_source("key", "value", {"key": ["a", "b"], "value": [10, 20]})
         op = SelectDataColumns(columns=["value"])
-        op_node = OperatorNode(op, input_streams=[src])
+        op_node = OperatorJobNode(op, input_streams=[src])
 
         input_ch = Channel(buffer_size=16)
         output_ch = Channel(buffer_size=16)
@@ -131,7 +145,7 @@ class TestFunctionNodeAsyncExecute:
         src = _make_source("key", "value", {"key": ["a", "b"], "value": [10, 20]})
         pf = PythonDataFunction(double_value, output_keys="result")
         pod = FunctionPod(pf)
-        node = FunctionNode(pod, src)
+        node = FunctionJobNode(pod, src)
 
         input_ch = Channel(buffer_size=16)
         output_ch = Channel(buffer_size=16)
@@ -162,15 +176,14 @@ class TestOrchestratorLinearPipeline:
         pf = PythonDataFunction(double_value, output_keys="result")
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="linear", pipeline_database=InMemoryArrowDatabase())
-        with pipeline:
+        job = PipelineJob(name="linear", store=InMemoryArrowDatabase())
+        with job:
             pod(src, label="doubler")
+        # job.run() auto-flushes database writes at the end of execution;
+        # explicit pipeline.flush() is no longer required.
+        job.run(orchestrator=AsyncPipelineOrchestrator())
 
-        pipeline.compile()
-        AsyncPipelineOrchestrator().run(pipeline._node_graph)
-        pipeline.flush()
-
-        records = pipeline.doubler.get_all_records()
+        records = job.nodes["doubler"].get_all_records()
         assert records is not None
         assert records.num_rows == 3
 
@@ -184,24 +197,19 @@ class TestOrchestratorLinearPipeline:
         pod = FunctionPod(pf)
 
         # Sync
-        sync_pipeline = Pipeline(name="sync", pipeline_database=InMemoryArrowDatabase())
-        with sync_pipeline:
+        sync_job = PipelineJob(name="sync", store=InMemoryArrowDatabase())
+        with sync_job:
             pod(src, label="doubler")
-        sync_pipeline.run()
-        sync_records = sync_pipeline.doubler.get_all_records()
+        sync_job.run()
+        sync_records = sync_job.nodes["doubler"].get_all_records()
         sync_values = sorted(sync_records.column("result").to_pylist())
 
         # Async
-        async_pipeline = Pipeline(
-            name="async", pipeline_database=InMemoryArrowDatabase()
-        )
-        with async_pipeline:
+        async_job = PipelineJob(name="async", store=InMemoryArrowDatabase())
+        with async_job:
             pod(src, label="doubler")
-        pipeline = async_pipeline
-        pipeline.compile()
-        AsyncPipelineOrchestrator().run(pipeline._node_graph)
-        pipeline.flush()
-        async_records = pipeline.doubler.get_all_records()
+        async_job.run(orchestrator=AsyncPipelineOrchestrator())
+        async_records = async_job.nodes["doubler"].get_all_records()
         async_values = sorted(async_records.column("result").to_pylist())
 
         assert sync_values == async_values
@@ -225,16 +233,13 @@ class TestOrchestratorOperatorPipeline:
         pf = PythonDataFunction(double_val, output_keys="result")
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="op_pipe", pipeline_database=InMemoryArrowDatabase())
-        with pipeline:
+        job = PipelineJob(name="op_pipe", store=InMemoryArrowDatabase())
+        with job:
             mapped = op(src, label="mapper")
             pod(mapped, label="doubler")
+        job.run(orchestrator=AsyncPipelineOrchestrator())
 
-        pipeline.compile()
-        AsyncPipelineOrchestrator().run(pipeline._node_graph)
-        pipeline.flush()
-
-        records = pipeline.doubler.get_all_records()
+        records = job.nodes["doubler"].get_all_records()
         assert records is not None
         assert records.num_rows == 3
         values = sorted(records.column("result").to_pylist())
@@ -254,16 +259,13 @@ class TestOrchestratorDiamondDag:
         pf = PythonDataFunction(add_values, output_keys="total")
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="diamond", pipeline_database=InMemoryArrowDatabase())
-        with pipeline:
+        job = PipelineJob(name="diamond", store=InMemoryArrowDatabase())
+        with job:
             joined = Join()(src_a, src_b, label="join")
             pod(joined, label="adder")
+        job.run(orchestrator=AsyncPipelineOrchestrator())
 
-        pipeline.compile()
-        AsyncPipelineOrchestrator().run(pipeline._node_graph)
-        pipeline.flush()
-
-        records = pipeline.adder.get_all_records()
+        records = job.nodes["adder"].get_all_records()
         assert records is not None
         assert records.num_rows == 2
         values = sorted(records.column("total").to_pylist())
@@ -276,59 +278,76 @@ class TestOrchestratorDiamondDag:
         pod = FunctionPod(pf)
 
         # Sync
-        sync_pipeline = Pipeline(
-            name="sync_diamond", pipeline_database=InMemoryArrowDatabase()
-        )
-        with sync_pipeline:
+        sync_job = PipelineJob(name="sync_diamond", store=InMemoryArrowDatabase())
+        with sync_job:
             joined = Join()(src_a, src_b, label="join")
             pod(joined, label="adder")
-        sync_pipeline.run()
+        sync_job.run()
         sync_values = sorted(
-            sync_pipeline.adder.get_all_records().column("total").to_pylist()
+            sync_job.nodes["adder"].get_all_records().column("total").to_pylist()
         )
+        # Attribute-based access (sync_job.adder) is equivalent to
+        # sync_job.nodes["adder"] via AbstractPipelineBase.__getattr__.
+        assert sync_job.adder is sync_job.nodes["adder"]
 
         # Async
-        async_pipeline = Pipeline(
-            name="async_diamond", pipeline_database=InMemoryArrowDatabase()
-        )
-        with async_pipeline:
+        async_job = PipelineJob(name="async_diamond", store=InMemoryArrowDatabase())
+        with async_job:
             joined = Join()(src_a, src_b, label="join")
             pod(joined, label="adder")
-        async_pipeline.compile()
-        AsyncPipelineOrchestrator().run(async_pipeline._node_graph)
-        async_pipeline.flush()
+        async_job.run(orchestrator=AsyncPipelineOrchestrator())
         async_values = sorted(
-            async_pipeline.adder.get_all_records().column("total").to_pylist()
+            async_job.nodes["adder"].get_all_records().column("total").to_pylist()
         )
 
         assert sync_values == async_values
 
 
 # ===========================================================================
-# 7. run_async entry point (for callers inside event loop)
+# 7. run_async entry point (for callers inside an event loop)
 # ===========================================================================
 
 
 class TestOrchestratorRunAsync:
     @pytest.mark.asyncio
     async def test_run_async_from_event_loop(self):
-        """run_async should work when called from inside an event loop."""
+        """run_async() can be awaited from within a running event loop.
+
+        ``job.run()`` calls ``asyncio.run()`` internally, which cannot be
+        invoked from inside a running event loop.  ``run_async()`` is the
+        correct entry point for callers that are already inside an event loop
+        (e.g. async frameworks, async tests).  This test verifies that path
+        directly by constructing the execution DAG that the orchestrator
+        operates on and calling ``run_async()`` instead of ``run()``.
+        """
         src = _make_source("key", "value", {"key": ["a", "b"], "value": [1, 2]})
         pf = PythonDataFunction(double_value, output_keys="result")
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(
-            name="async_loop", pipeline_database=InMemoryArrowDatabase()
-        )
-        with pipeline:
+        job = PipelineJob(name="async_loop", store=InMemoryArrowDatabase())
+        with job:
             pod(src, label="doubler")
 
-        pipeline.compile()
-        orchestrator = AsyncPipelineOrchestrator()
-        await orchestrator.run_async(pipeline._node_graph)
-        pipeline.flush()
+        # Build the execution DAG from the job's internal node map, mirroring
+        # what PipelineJob.run() does.  Tests are allowed to access internal
+        # state to exercise code paths not reachable through the public API.
+        exec_dag: OrcaDAG = OrcaDAG()
+        for node in job._persistent_node_map.values():
+            exec_dag.add_node(node)
+        for u_hash, v_hash in job._graph_edges:
+            if (
+                u_hash in job._persistent_node_map
+                and v_hash in job._persistent_node_map
+            ):
+                exec_dag.add_edge(
+                    job._persistent_node_map[u_hash],
+                    job._persistent_node_map[v_hash],
+                )
 
-        records = pipeline.doubler.get_all_records()
+        orchestrator = AsyncPipelineOrchestrator()
+        await orchestrator.run_async(exec_dag)
+
+        records = job.nodes["doubler"].get_all_records()
         assert records is not None
         values = sorted(records.column("result").to_pylist())
         assert values == [2, 4]
@@ -341,22 +360,19 @@ class TestOrchestratorRunAsync:
 
 class TestBufferSizeConfiguration:
     def test_custom_buffer_size(self):
-        """Pipeline should work with custom buffer sizes."""
+        """PipelineJob should work with custom buffer sizes."""
         src = _make_source("key", "value", {"key": ["a", "b"], "value": [1, 2]})
         pf = PythonDataFunction(double_value, output_keys="result")
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="bufsize", pipeline_database=InMemoryArrowDatabase())
-        with pipeline:
+        job = PipelineJob(name="bufsize", store=InMemoryArrowDatabase())
+        with job:
             pod(src, label="doubler")
+        job.run(orchestrator=AsyncPipelineOrchestrator(buffer_size=4))
 
-        pipeline.compile()
-        AsyncPipelineOrchestrator(buffer_size=4).run(pipeline._node_graph)
-        pipeline.flush()
-
-        records = pipeline.doubler.get_all_records()
+        records = job.nodes["doubler"].get_all_records()
         assert records is not None
-        assert records.num_rows == 2
+        assert records.num_rows == 2  # source has 2 rows
 
 
 # ===========================================================================
@@ -379,25 +395,22 @@ class TestAsyncOrchestratorFanOut:
         pf2 = PythonDataFunction(triple_value, output_keys="result")
         pod2 = FunctionPod(pf2)
 
-        pipeline = Pipeline(name="fanout", pipeline_database=InMemoryArrowDatabase())
-        with pipeline:
+        job = PipelineJob(name="fanout", store=InMemoryArrowDatabase())
+        with job:
             pod1(src, label="doubler")
             pod2(src, label="tripler")
+        job.run(orchestrator=AsyncPipelineOrchestrator())
 
-        pipeline.compile()
-        orch = AsyncPipelineOrchestrator()
-        result = orch.run(pipeline._node_graph, materialize_results=True)
-        pipeline.flush()
+        doubler_records = job.nodes["doubler"].get_all_records()
+        tripler_records = job.nodes["tripler"].get_all_records()
+        assert doubler_records is not None
+        assert tripler_records is not None
 
-        fn_outputs = [
-            v for k, v in result.node_outputs.items() if k.node_type == "function"
-        ]
-        assert len(fn_outputs) == 2
-        all_values = sorted(
-            [pkt.as_dict()["result"] for output in fn_outputs for _, pkt in output]
-        )
+        doubler_values = sorted(doubler_records.column("result").to_pylist())
+        tripler_values = sorted(tripler_records.column("result").to_pylist())
         # double_value: [2, 4], triple_value: [3, 6]
-        assert all_values == [2, 3, 4, 6]
+        assert doubler_values == [2, 4]
+        assert tripler_values == [3, 6]
 
 
 # ===========================================================================
@@ -410,11 +423,15 @@ class TestAsyncOrchestratorTerminalNode:
 
     def test_single_terminal_source(self):
         """A pipeline with just a source (terminal) should work."""
-        import networkx as nx
-
         src = _make_source("key", "value", {"key": ["a"], "value": [1]})
-        node = SourceNode(src)
-        G = nx.DiGraph()
+        tag_schema, data_schema = src.output_schema()
+        node = SourceJobNode(
+            name="test_src",
+            tag_schema=tag_schema,
+            data_schema=data_schema,
+            bound_source=src,
+        )
+        G: OrcaDAG = OrcaDAG()
         G.add_node(node)
 
         orch = AsyncPipelineOrchestrator()
@@ -439,20 +456,15 @@ class TestAsyncOrchestratorErrorPropagation:
         pf = PythonDataFunction(failing_fn, output_keys="result")
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="error", pipeline_database=InMemoryArrowDatabase())
-        with pipeline:
+        job = PipelineJob(name="error", store=InMemoryArrowDatabase())
+        with job:
             pod(src, label="failer")
 
-        pipeline.compile()
-        orch = AsyncPipelineOrchestrator()
-
         # Pipeline must complete without raising; failing data is silently dropped.
-        orch.run(pipeline._node_graph)
+        job.run(orchestrator=AsyncPipelineOrchestrator())
 
     def test_node_failure_calls_on_data_crash(self):
         """When an observer is set, on_data_crash is called for the failing data."""
-        from orcapod.pipeline.observer import NoOpObserver
-
         def failing_fn(value: int) -> int:
             raise ValueError("intentional failure")
 
@@ -460,8 +472,8 @@ class TestAsyncOrchestratorErrorPropagation:
         pf = PythonDataFunction(failing_fn, output_keys="result")
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="error2", pipeline_database=InMemoryArrowDatabase())
-        with pipeline:
+        job = PipelineJob(name="error2", store=InMemoryArrowDatabase())
+        with job:
             pod(src, label="failer")
 
         crashes = []
@@ -470,9 +482,7 @@ class TestAsyncOrchestratorErrorPropagation:
             def on_data_crash(self, node_label, tag, data, error):
                 crashes.append(error)
 
-        pipeline.compile()
-        orch = AsyncPipelineOrchestrator()
-        orch.run(pipeline._node_graph, observer=CrashRecorder())
+        job.run(orchestrator=AsyncPipelineOrchestrator(), observer=CrashRecorder())
 
         assert len(crashes) == 1
         assert isinstance(crashes[0], (ValueError, RuntimeError))
@@ -487,8 +497,8 @@ class TestAsyncOrchestratorObserverInjection:
         pf = PythonDataFunction(double_value, output_keys="result")
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="async_obs", pipeline_database=InMemoryArrowDatabase())
-        with pipeline:
+        job = PipelineJob(name="async_obs", store=InMemoryArrowDatabase())
+        with job:
             pod(src, label="doubler")
 
         events = []
@@ -506,14 +516,11 @@ class TestAsyncOrchestratorObserverInjection:
                 events.append(("data_end", node_label, cached))
             def on_data_crash(self, node_label, tag, data, exc): pass
             def create_data_logger(self, tag, data, **kwargs):
-                from orcapod.pipeline.observer import _NOOP_LOGGER
-                return _NOOP_LOGGER
+                return NoOpObserver().create_data_logger(tag, data)
             def contextualize(self, *identity_path):
                 return self
 
-        pipeline.compile()
-        orch = AsyncPipelineOrchestrator()
-        orch.run(pipeline._node_graph, observer=RecordingObserver())
+        job.run(orchestrator=AsyncPipelineOrchestrator(), observer=RecordingObserver())
 
         # Source fires node_start/node_end (label contains "ArrowTableSource" or similar)
         source_starts = [e for e in events if e[0] == "node_start" and e[1] != "doubler"]
@@ -541,10 +548,8 @@ class TestAsyncOrchestratorObserverInjection:
         pf = PythonDataFunction(double_val, output_keys="result")
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(
-            name="async_obs_op", pipeline_database=InMemoryArrowDatabase()
-        )
-        with pipeline:
+        job = PipelineJob(name="async_obs_op", store=InMemoryArrowDatabase())
+        with job:
             mapped = op(src, label="mapper")
             pod(mapped, label="doubler")
 
@@ -563,14 +568,11 @@ class TestAsyncOrchestratorObserverInjection:
                 events.append(("data_end", node_label))
             def on_data_crash(self, node_label, tag, data, exc): pass
             def create_data_logger(self, tag, data, **kwargs):
-                from orcapod.pipeline.observer import _NOOP_LOGGER
-                return _NOOP_LOGGER
+                return NoOpObserver().create_data_logger(tag, data)
             def contextualize(self, *identity_path):
                 return self
 
-        pipeline.compile()
-        orch = AsyncPipelineOrchestrator()
-        orch.run(pipeline._node_graph, observer=RecordingObserver())
+        job.run(orchestrator=AsyncPipelineOrchestrator(), observer=RecordingObserver())
 
         # All labeled nodes fire start/end
         assert ("node_start", "mapper") in events
@@ -588,20 +590,14 @@ class TestAsyncOrchestratorObserverInjection:
         pf = PythonDataFunction(double_value, output_keys="result")
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(
-            name="async_no_obs", pipeline_database=InMemoryArrowDatabase()
-        )
-        with pipeline:
+        job = PipelineJob(name="async_no_obs", store=InMemoryArrowDatabase())
+        with job:
             pod(src, label="doubler")
+        job.run(orchestrator=AsyncPipelineOrchestrator())  # no observer
 
-        pipeline.compile()
-        orch = AsyncPipelineOrchestrator()  # no observer
-        result = orch.run(pipeline._node_graph, materialize_results=True)
-        fn_outputs = [
-            v for k, v in result.node_outputs.items() if k.node_type == "function"
-        ]
-        assert len(fn_outputs) == 1
-        assert len(fn_outputs[0]) == 1
+        records = job.nodes["doubler"].get_all_records()
+        assert records is not None
+        assert records.num_rows == 1
 
 
 def test_async_orchestrator_accepts_observer_in_run():

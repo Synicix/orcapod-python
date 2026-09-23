@@ -7,6 +7,7 @@ PF_VARIATION_PREFIX = "pf_var_"
 PF_EXECUTION_PREFIX = "pf_exec_"
 DATA_CONTEXT_KEY = "context_key"
 INPUT_DATA_HASH_COL = "input_data_hash"
+OUTPUT_DATA_HASH_COL = "output_data_hash"
 DATA_RECORD_ID = "data_id"
 NODE_CONTENT_HASH_COL = "node_content_hash"
 SYSTEM_TAG_PREFIX_NAME = "tag"
@@ -18,6 +19,10 @@ POD_TIMESTAMP = "pod_ts"
 FIELD_SEPARATOR = ":"
 BLOCK_SEPARATOR = "::"
 ENV_INFO = "env_info"
+IS_EPHEMERAL_COL = "is_ephemeral"
+PIPELINE_DB_SCHEMA_VERSION = "pdb_v1"
+RESULT_DB_SCHEMA_VERSION = "rdb_v1"
+TRACKING_DB_SCHEMA_VERSION = "tdb_v1"
 
 
 class SystemConstant:
@@ -65,12 +70,16 @@ class SystemConstant:
         return f"{self._global_prefix}{SYSTEM_COLUMN_PREFIX}{INPUT_DATA_HASH_COL}"
 
     @property
+    def OUTPUT_DATA_HASH_COL(self) -> str:
+        return f"{self._global_prefix}{SYSTEM_COLUMN_PREFIX}{OUTPUT_DATA_HASH_COL}"
+
+    @property
     def DATA_RECORD_ID(self) -> str:
         return f"{self._global_prefix}{SYSTEM_COLUMN_PREFIX}{DATA_RECORD_ID}"
 
     @property
     def NODE_CONTENT_HASH_COL(self) -> str:
-        return f"{self._global_prefix}{DATAGRAM_PREFIX}{NODE_CONTENT_HASH_COL}"
+        return f"{self._global_prefix}{SYSTEM_COLUMN_PREFIX}{NODE_CONTENT_HASH_COL}"
 
     @property
     def SYSTEM_TAG_PREFIX(self) -> str:
@@ -99,6 +108,10 @@ class SystemConstant:
     @property
     def ENV_INFO(self) -> str:
         return f"{self._global_prefix}{SYSTEM_COLUMN_PREFIX}{ENV_INFO}"
+
+    @property
+    def IS_EPHEMERAL_COL(self) -> str:
+        return f"{self._global_prefix}{SYSTEM_COLUMN_PREFIX}{IS_EPHEMERAL_COL}"
 
 
 constants = SystemConstant()

@@ -380,3 +380,102 @@ def intersection_schemas(*schemas: SchemaLike) -> Schema:
                     f"Type conflict for key '{key}': {intersection[key]} vs {schema[key]}"
                 )
     return Schema(intersection)
+
+
+def compute_schema_hash(
+    tag_schema: Schema,
+    data_schema: Schema,
+    semantic_hasher: Any,
+    char_count: int | None,
+) -> str:
+    """Compute the schema hash used for system-tag column naming.
+
+    This is the same hash that ``SourceStreamBuilder`` embeds in system-tag
+    column names when building an ``ArrowTableStream`` from a source table.
+    Extracting it here lets ``SourceNodeBase`` predict the system-tag column
+    names from its declared schemas alone, without requiring a live source.
+
+    Args:
+        tag_schema: Python tag schema (``Schema`` mapping column names to types).
+        data_schema: Python data schema.
+        semantic_hasher: Hasher from the active ``DataContext``
+            (``data_context.semantic_hasher``).
+        char_count: Number of hex characters to include. ``None`` (the default)
+            returns the full hex digest. Pass a positive integer to truncate
+            (e.g. for backwards compatibility with stored data).
+
+    Returns:
+        Hex string — full digest length when ``char_count`` is ``None``,
+        otherwise truncated to ``char_count`` characters.
+    """
+    return semantic_hasher.hash_object(
+        (tag_schema, data_schema)
+    ).to_hex(char_count=char_count)
+
+
+def compute_source_schema_hash(
+    tag_schema: Schema,
+    data_schema: Schema,
+    data_context: Any,
+    config: Any,
+) -> str:
+    """Compute the schema hash for system-tag column naming from a ``DataContext`` and config.
+
+    This is the canonical single entry-point used by ``SourceStreamBuilder``,
+    ``SourceNodeBase``, and ``PollingSource`` so the unpacking of
+    ``data_context.semantic_hasher`` and ``config.hashing.schema_n_char``
+    is not replicated at every call site.
+
+    Args:
+        tag_schema: Python tag schema (``Schema`` mapping column names to types).
+        data_schema: Python data schema.
+        data_context: Active ``DataContext`` — its ``semantic_hasher`` attribute
+            is used for hashing.
+        config: Active ``OrcapodConfig`` — ``config.hashing.schema_n_char``
+            controls hash truncation.
+
+    Returns:
+        Hex string schema hash, truncated to ``config.hashing.schema_n_char``
+        characters.
+    """
+    return compute_schema_hash(
+        tag_schema,
+        data_schema,
+        data_context.semantic_hasher,
+        config.hashing.schema_n_char,
+    )
+
+
+def _normalize_column_list(value: Any) -> list[str]:
+    """Normalize a column-list argument to a plain list of strings.
+
+    Accepts a bare string (wraps it in a list), any iterable of strings
+    (converts to list), or raises ``TypeError`` for non-string non-iterable
+    inputs or iterables that contain non-string elements.
+
+    Args:
+        value: A single column name (``str``) or an iterable of column names.
+
+    Returns:
+        A list of column name strings.
+
+    Raises:
+        TypeError: If ``value`` is not a ``str`` or iterable, or if any
+            element of the iterable is not a ``str``.
+    """
+    if isinstance(value, str):
+        return [value]
+    try:
+        result = list(value)
+    except TypeError:
+        raise TypeError(
+            f"tag_columns must be a string or iterable of strings, "
+            f"got {type(value).__name__!r}"
+        )
+    bad = [x for x in result if not isinstance(x, str)]
+    if bad:
+        raise TypeError(
+            f"All tag_columns elements must be strings; "
+            f"got {[type(x).__name__ for x in bad]!r}"
+        )
+    return result

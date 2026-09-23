@@ -2,7 +2,7 @@
 
 Exercises the full logging pipeline: capture → CapturedLogs return type →
 FunctionNode → observer → DataLogger → database, using InMemoryArrowDatabase
-and real Pipeline objects.
+and real PipelineJob objects.
 """
 
 from __future__ import annotations
@@ -17,10 +17,11 @@ from orcapod.core.sources.arrow_table_source import ArrowTableSource
 from orcapod.databases import InMemoryArrowDatabase
 from orcapod.pipeline import (
     AsyncPipelineOrchestrator,
-    Pipeline,
     SyncPipelineOrchestrator,
 )
+from orcapod.pipeline.job import PipelineJob
 from orcapod.pipeline.logging_observer import LoggingObserver
+from orcapod.pipeline.serialization import DatabaseRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -34,16 +35,6 @@ def _make_source(n: int = 3) -> ArrowTableSource:
         "x": pa.array([10 * (i + 1) for i in range(n)], type=pa.int64()),
     })
     return ArrowTableSource(table, tag_columns=["id"], infer_nullable=True)
-
-
-def _get_function_node(pipeline: Pipeline):
-    """Return the first function node from the pipeline graph."""
-    import networkx as nx
-
-    for node in nx.topological_sort(pipeline._node_graph):
-        if node.node_type == "function":
-            return node
-    raise RuntimeError("No function node found")
 
 
 # ---------------------------------------------------------------------------
@@ -63,13 +54,12 @@ class TestSyncPipelineSuccessLogs:
         pf = PythonDataFunction(double, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_logs", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_logs", store=db)
+        with job:
             pod(source, label="doubler")
 
         obs = LoggingObserver(log_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         logs = obs.get_logs()
 
@@ -95,13 +85,12 @@ class TestFailingDatasLogged:
         pf = PythonDataFunction(failing, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_fail", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_fail", store=db)
+        with job:
             pod(source, label="failing")
 
         obs = LoggingObserver(log_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         logs = obs.get_logs()
 
@@ -131,13 +120,12 @@ class TestFlatLogStorage:
         pf = PythonDataFunction(identity, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_flat", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_flat", store=db)
+        with job:
             pod(source, label="ident")
 
         obs = LoggingObserver(log_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         logs = obs.get_logs()
         assert logs is not None
@@ -163,13 +151,12 @@ class TestQueryableTagColumns:
         pf = PythonDataFunction(identity, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_tags", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_tags", store=db)
+        with job:
             pod(source, label="ident")
 
         obs = LoggingObserver(log_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         logs = obs.get_logs()
 
@@ -197,13 +184,12 @@ class TestAsyncOrchestratorLogs:
         pf = PythonDataFunction(double, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_async_logs", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_async_logs", store=db)
+        with job:
             pod(source, label="doubler")
 
         obs = LoggingObserver(log_database=db)
-        orch = AsyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(orchestrator=AsyncPipelineOrchestrator(), observer=obs)
 
         logs = obs.get_logs()
 
@@ -228,15 +214,15 @@ class TestFailFastErrorPolicy:
         pf = PythonDataFunction(failing, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_failfast", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_failfast", store=db)
+        with job:
             pod(source, label="failing")
 
         obs = LoggingObserver(log_database=db)
         orch = SyncPipelineOrchestrator(error_policy="fail_fast")
 
         with pytest.raises(RuntimeError, match="crash"):
-            pipeline.run(orchestrator=orch, observer=obs)
+            job.run(orchestrator=orch, observer=obs)
 
         logs = obs.get_logs()
 
@@ -269,13 +255,12 @@ class TestMixedSuccessFailure:
         pf = PythonDataFunction(safe_div, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_mixed", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_mixed", store=db)
+        with job:
             pod(source, label="divider")
 
         obs = LoggingObserver(log_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         logs = obs.get_logs()
 
@@ -307,14 +292,13 @@ class TestMultipleFunctionNodesCombinedLogs:
         pf2 = PythonDataFunction(triple, output_keys="final", executor=LocalPythonFunctionExecutor())
         pod2 = FunctionPod(pf2)
 
-        pipeline = Pipeline(name="test_multi", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_multi", store=db)
+        with job:
             s1 = pod1(source, label="doubler")
             pod2(s1, label="tripler")
 
         obs = LoggingObserver(log_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         logs = obs.get_logs()
         assert logs is not None
@@ -323,12 +307,13 @@ class TestMultipleFunctionNodesCombinedLogs:
 
 
 # ---------------------------------------------------------------------------
-# 9. get_logs() returns all logs aggregated across all node sub-paths
+# 9. get_logs() aggregates across all node sub-paths
 # ---------------------------------------------------------------------------
 
 
 class TestGetLogsNodeSpecific:
     def test_get_logs_returns_rows_for_all_nodes(self):
+        """get_logs() should return aggregated rows covering every node."""
         db = InMemoryArrowDatabase()
         source = _make_source(2)
 
@@ -343,18 +328,17 @@ class TestGetLogsNodeSpecific:
         pf2 = PythonDataFunction(triple, output_keys="final", executor=LocalPythonFunctionExecutor())
         pod2 = FunctionPod(pf2)
 
-        pipeline = Pipeline(name="test_filter", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_filter", store=db)
+        with job:
             s1 = pod1(source, label="doubler")
             pod2(s1, label="tripler")
 
         obs = LoggingObserver(log_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         logs = obs.get_logs()
         assert logs is not None
-        # Node identity is in path — row count confirms both nodes written
+        # get_logs() aggregates across all node sub-paths:
         # 2 data × 2 nodes = 4 log rows total
         assert logs.num_rows == 4
 
@@ -368,7 +352,6 @@ def test_logging_observer_to_config_shape():
     db = InMemoryArrowDatabase()
     log_db = db.at("my_pipeline", "_log")
     obs = LoggingObserver(log_db)
-    from orcapod.pipeline.serialization import DatabaseRegistry
     registry = DatabaseRegistry()
     config = obs.to_config(db_registry=registry)
     assert config["type"] == "logging"
@@ -380,7 +363,6 @@ def test_logging_observer_from_config_round_trip():
     db = InMemoryArrowDatabase()
     log_db = db.at("my_pipeline", "_log")
     obs = LoggingObserver(log_db)
-    from orcapod.pipeline.serialization import DatabaseRegistry
     registry = DatabaseRegistry()
     config = obs.to_config(db_registry=registry)
     restored = LoggingObserver.from_config(config, registry.to_dict())

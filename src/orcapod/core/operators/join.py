@@ -95,19 +95,19 @@ class Join(NonZeroInputOperator):
         appending ::{pipeline_hash}:{canonical_position}. This method
         computes those output column names without performing the join.
         """
-        n_char = self.orcapod_config.system_tag_hash_n_char
+        n_char = self.orcapod_config.hashing.system_tag_n_char
         ordered_streams = self.order_input_streams(*streams)
 
         system_tag_fields: dict[str, type] = {}
         for idx, stream in enumerate(ordered_streams):
             stream_tag_schema, _ = stream.output_schema(columns={"system_tags": True})
-            for col_name in stream_tag_schema:
+            for col_name, col_type in stream_tag_schema.items():
                 if col_name.startswith(constants.SYSTEM_TAG_PREFIX):
                     new_name = (
                         f"{col_name}{constants.BLOCK_SEPARATOR}"
                         f"{stream.pipeline_hash().to_hex(n_char)}:{idx}"
                     )
-                    system_tag_fields[new_name] = str
+                    system_tag_fields[new_name] = col_type
         return Schema(system_tag_fields)
 
     def static_process(self, *streams: StreamProtocol) -> StreamProtocol:
@@ -124,7 +124,7 @@ class Join(NonZeroInputOperator):
 
         COMMON_JOIN_KEY = "_common"
 
-        n_char = self.orcapod_config.system_tag_hash_n_char
+        n_char = self.orcapod_config.hashing.system_tag_n_char
 
         stream = ordered_streams[0]
 
@@ -132,8 +132,9 @@ class Join(NonZeroInputOperator):
         table = stream.as_table(
             columns={"source": True, "system_tags": True, "meta": True}
         )
-        # trick to get cartesian product
-        table = table.add_column(0, COMMON_JOIN_KEY, pa.array([0] * len(table)))
+        # trick to get cartesian product; use int8 explicitly so that zero-row
+        # tables don't produce a null-typed column that Polars rejects on join
+        table = table.add_column(0, COMMON_JOIN_KEY, pa.array([0] * len(table), type=pa.int8()))
         table = arrow_utils.append_to_system_tags(
             table,
             f"{stream.pipeline_hash().to_hex(n_char)}:0",
@@ -151,7 +152,7 @@ class Join(NonZeroInputOperator):
             # trick to ensure that there will always be at least one shared key
             # this ensure that no overlap in keys lead to full caretesian product
             next_table = next_table.add_column(
-                0, COMMON_JOIN_KEY, pa.array([0] * len(next_table))
+                0, COMMON_JOIN_KEY, pa.array([0] * len(next_table), type=pa.int8())
             )
 
             # Rename any non-key columns in next_table that would collide with
@@ -238,7 +239,7 @@ class Join(NonZeroInputOperator):
         Returns:
             List of suffix strings, one per input position.
         """
-        n_char = self.orcapod_config.system_tag_hash_n_char
+        n_char = self.orcapod_config.hashing.system_tag_n_char
         hex_strings = [h.to_hex() for h in input_pipeline_hashes]
 
         # Canonical order: sorted by full hex (same as order_input_streams).
@@ -699,7 +700,7 @@ class Join(NonZeroInputOperator):
                 sid_val = merged_sys.get(fmap.get(sid_field, ""))
                 rid_val = merged_sys.get(fmap.get(rid_field, ""))
                 vals = {ft: merged_sys[k] for ft, k in fmap.items()}
-                entries.append(((sid_val or "", rid_val or ""), vals))
+                entries.append(((sid_val or "", rid_val or b""), vals))
 
             entries.sort(key=lambda e: e[0])
 

@@ -18,12 +18,13 @@ from orcapod.pipeline.result import OrchestratorResult
 from orcapod.protocols.node_protocols import (
     is_function_node,
     is_operator_node,
+    is_side_effect_function_node,
+    is_side_effect_node,
     is_source_node,
 )
 
 if TYPE_CHECKING:
-    import networkx as nx
-
+    from orcapod.pipeline.dag import GraphProtocol
     from orcapod.protocols.core_protocols import DataProtocol, TagProtocol
     from orcapod.protocols.observability_protocols import ExecutionObserverProtocol
 
@@ -56,7 +57,7 @@ class AsyncPipelineOrchestrator:
 
     def run(
         self,
-        graph: nx.DiGraph,
+        graph: "GraphProtocol[Any]",
         *,
         observer: ExecutionObserverProtocol | None = None,
         materialize_results: bool = True,
@@ -66,7 +67,7 @@ class AsyncPipelineOrchestrator:
         """Synchronous entry point — runs the async pipeline to completion.
 
         Args:
-            graph: A NetworkX DiGraph with GraphNode objects as vertices.
+            graph: A ``GraphProtocol`` DAG with GraphNode objects as vertices.
             observer: Optional execution observer forwarded to nodes.
             materialize_results: If True, collect all node outputs into
                 the result. If False, return empty node_outputs.
@@ -91,7 +92,7 @@ class AsyncPipelineOrchestrator:
 
     async def run_async(
         self,
-        graph: nx.DiGraph,
+        graph: "GraphProtocol[Any]",
         *,
         observer: ExecutionObserverProtocol | None = None,
         materialize_results: bool = True,
@@ -101,7 +102,7 @@ class AsyncPipelineOrchestrator:
         """Async entry point for callers already inside an event loop.
 
         Args:
-            graph: A NetworkX DiGraph with GraphNode objects as vertices.
+            graph: A ``GraphProtocol`` DAG with GraphNode objects as vertices.
             observer: Optional execution observer forwarded to nodes.
             materialize_results: If True, collect all node outputs.
             run_id: Optional run identifier.  If not provided, a UUID is
@@ -122,7 +123,7 @@ class AsyncPipelineOrchestrator:
 
     async def _run_async(
         self,
-        graph: nx.DiGraph,
+        graph: "GraphProtocol[Any]",
         materialize_results: bool,
         *,
         observer: ExecutionObserverProtocol | None = None,
@@ -131,14 +132,13 @@ class AsyncPipelineOrchestrator:
     ) -> OrchestratorResult:
         """Core async logic: wire channels, launch tasks, collect results."""
         from orcapod.pipeline.observer import NoOpObserver
-        import networkx as nx
 
         run_id = run_id or str(uuid.uuid4())
         effective_observer = observer if observer is not None else NoOpObserver()
         effective_observer.on_run_start(run_id, pipeline_uri=pipeline_uri)
 
         try:
-            topo_order = list(nx.topological_sort(graph))
+            topo_order = list(graph.topological_sort())
             buf = self._buffer_size
 
             # Build edge maps
@@ -190,17 +190,16 @@ class AsyncPipelineOrchestrator:
                         tg.create_task(
                             node.async_execute(writer, observer=effective_observer)
                         )
-                    elif is_function_node(node):
+                    elif is_function_node(node) or is_side_effect_function_node(node):
                         predecessors = in_edges.get(node, [])
                         if len(predecessors) != 1:
                             raise ValueError(
-                                f"FunctionNode expects exactly 1 upstream, "
-                                f"got {len(predecessors)}"
+                                f"FunctionNode expects exactly 1 upstream, got {len(predecessors)}"
                             )
                         input_reader = edge_readers[(predecessors[0], node)]
                         tg.create_task(
                             node.async_execute(
-                                input_reader, writer, observer=effective_observer
+                                input_reader, writer, observer=effective_observer, run_id=run_id
                             )
                         )
                     elif is_operator_node(node):
@@ -218,6 +217,21 @@ class AsyncPipelineOrchestrator:
                         tg.create_task(
                             node.async_execute(
                                 input_readers, writer, observer=effective_observer
+                            )
+                        )
+                    elif is_side_effect_node(node):
+                        predecessors = in_edges.get(node, [])
+                        if not predecessors:
+                            raise ValueError(
+                                f"SideEffectNode expects exactly 1 upstream, got 0"
+                            )
+                        input_reader = edge_readers[(predecessors[0], node)]
+                        tg.create_task(
+                            node.async_execute(
+                                [input_reader],
+                                writer,
+                                observer=effective_observer,
+                                run_id=run_id,
                             )
                         )
                     else:

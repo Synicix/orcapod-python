@@ -28,6 +28,7 @@ import pytest
 
 from orcapod.core.function_pod import FunctionPod
 from orcapod.core.nodes import FunctionNode
+from orcapod.core.nodes.function_node import FunctionJobNode
 from orcapod.core.sources import DerivedSource, RootSource
 from orcapod.core.streams import ArrowTableStream
 from orcapod.databases import InMemoryArrowDatabase
@@ -41,13 +42,13 @@ from ..conftest import double, make_int_stream
 # ---------------------------------------------------------------------------
 
 
-def _make_node(n: int = 3, db: InMemoryArrowDatabase | None = None) -> FunctionNode:
+def _make_node(n: int = 3, db: InMemoryArrowDatabase | None = None) -> FunctionJobNode:
     from orcapod.core.data_function import PythonDataFunction
 
     if db is None:
         db = InMemoryArrowDatabase()
     pf = PythonDataFunction(double, output_keys="result")
-    return FunctionNode(
+    return FunctionJobNode(
         function_pod=FunctionPod(data_function=pf),
         input_stream=make_int_stream(n=n),
         pipeline_database=db,
@@ -226,7 +227,7 @@ class TestDerivedSourceRoundTrip:
         result_stream = ArrowTableStream(result_table, tag_columns=["id"])
 
         double_result = PythonDataFunction(double, output_keys="result")
-        node2 = FunctionNode(
+        node2 = FunctionJobNode(
             function_pod=FunctionPod(data_function=double_result),
             input_stream=result_stream,
             pipeline_database=InMemoryArrowDatabase(),  # fresh DB
@@ -358,7 +359,7 @@ class TestDerivedSourceIdentity:
         node_double.run()
         src_double = node_double.as_source()
 
-        node_triple = FunctionNode(
+        node_triple = FunctionJobNode(
             function_pod=FunctionPod(data_function=triple_pf),
             input_stream=make_int_stream(n=3),
             pipeline_database=db,
@@ -379,12 +380,12 @@ class TestDerivedSourceIdentity:
         pf = PythonDataFunction(double, output_keys="result")
         stream = make_int_stream(n=3)
 
-        node_a = FunctionNode(
+        node_a = FunctionJobNode(
             function_pod=FunctionPod(data_function=pf),
             input_stream=stream,
             pipeline_database=InMemoryArrowDatabase(),
         )
-        node_b = FunctionNode(
+        node_b = FunctionJobNode(
             function_pod=FunctionPod(data_function=pf),
             input_stream=stream,
             pipeline_database=InMemoryArrowDatabase(),
@@ -414,11 +415,11 @@ class TestDerivedSourceId:
         sid = src.source_id
         assert "/" in sid  # path separator from pipeline_path
 
-    def test_source_id_contains_content_hash_fragment(self):
+    def test_source_id_contains_full_content_hash(self):
         node = _make_node(n=3)
         src = node.as_source()
-        content_frag = node.content_hash().to_string()[:16]
-        assert content_frag in src.source_id
+        full_hash = node.content_hash().to_string()
+        assert full_hash in src.source_id
 
     def test_different_nodes_different_source_ids(self):
         node_a = _make_node(n=3)
@@ -440,3 +441,21 @@ class TestDerivedSourceId:
             source_id="custom_id",
         )
         assert src.source_id == "custom_id"
+
+
+def test_derived_source_empty_cache_preserves_nullability():
+    """DerivedSource._get_stream() empty table preserves nullable=False for required fields.
+
+    Regression for ITL-563: pa.field() without nullable=False defaulted to True.
+    """
+    # _make_node() builds a FunctionJobNode with data output "result: int" (required).
+    node = _make_node()
+    source = node.as_source()  # DerivedSource backed by unrun node → empty cache
+
+    # as_table() triggers _get_stream() which hits the empty-cache branch
+    table = source.as_table()
+
+    assert table.num_rows == 0
+    # "result" is int (required), must not become int | None
+    result_field = table.schema.field("result")
+    assert result_field.nullable is False

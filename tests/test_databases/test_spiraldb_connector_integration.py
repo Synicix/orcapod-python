@@ -16,6 +16,20 @@ Project and server URL are configurable via env vars:
 
 - ``SPIRAL_PROJECT_ID`` (default: ``test-orcapod-362211``)
 - ``SPIRAL_SERVER_URL`` (default: ``http://api.spiraldb.dev``)
+
+Version compatibility note (PLT-1773)
+-------------------------------------
+pyspiral is in active development and must be kept current. The pinned version
+in ``uv.lock`` should be upgraded regularly (see PLT-1785 for the tracking issue).
+
+History: around 2026-06-15, ``t3.storage.dev`` (SpiralDB's object-storage
+backend) began strictly enforcing that every header in a presigned-URL request
+must appear in ``X-Amz-SignedHeaders``. pyspiral 0.11.7's embedded Rust HTTP
+client sent additional unsigned headers, causing all Vortex file reads to fail
+with ``AccessDenied: There were headers present in the request which were not
+signed``. Upgrading to pyspiral 0.14.x (which rewrote the HTTP stack in Python
+using ``httpx``) resolved the issue. If these tests start failing with a similar
+``AccessDenied`` / unsigned-headers error, upgrade pyspiral first.
 """
 from __future__ import annotations
 
@@ -59,66 +73,292 @@ class TestSpiralDBConnectorIntegration:
     def test_full_round_trip(self, connector):
         """Create table → write records → scan → verify values."""
         table_name = _unique_table("roundtrip")
-        connector.create_table_if_not_exists(
-            table_name,
-            columns=[
-                ColumnInfo("__record_id", pa.string(), nullable=False),
-                ColumnInfo("value", pa.float64()),
-            ],
-            pk_column="__record_id",
-        )
-        records = pa.table({
-            "__record_id": pa.array(["r1", "r2"], type=pa.string()),
-            "value": pa.array([10.0, 20.0], type=pa.float64()),
-        })
-        connector.upsert_records(table_name, records, id_column="__record_id")
+        try:
+            connector.create_table_if_not_exists(
+                table_name,
+                columns=[
+                    ColumnInfo("__record_id", pa.string(), nullable=False),
+                    ColumnInfo("value", pa.float64()),
+                ],
+                pk_column="__record_id",
+            )
+            records = pa.table({
+                "__record_id": pa.array(["r1", "r2"], type=pa.string()),
+                "value": pa.array([10.0, 20.0], type=pa.float64()),
+            })
+            connector.upsert_records(table_name, records, id_column="__record_id")
 
-        result = pa.Table.from_batches(
-            list(connector.iter_batches(f'SELECT * FROM "{table_name}"'))
-        )
-        assert result.num_rows == 2
-        assert sorted(result.column("__record_id").to_pylist()) == ["r1", "r2"]
+            result = pa.Table.from_batches(
+                list(connector.iter_batches(f'SELECT * FROM "{table_name}"'))
+            )
+            assert result.num_rows == 2
+            assert sorted(result.column("__record_id").to_pylist()) == ["r1", "r2"]
+        finally:
+            connector.delete_table(table_name)
 
     def test_skip_existing_true(self, connector):
         """Write once, write again with overlapping keys — verify no duplication."""
         table_name = _unique_table("skip")
-        connector.create_table_if_not_exists(
-            table_name,
-            columns=[
-                ColumnInfo("id", pa.string(), nullable=False),
-                ColumnInfo("val", pa.int64()),
-            ],
-            pk_column="id",
-        )
-        first_write = pa.table({"id": ["a", "b"], "val": pa.array([1, 2], type=pa.int64())})
-        connector.upsert_records(table_name, first_write, id_column="id")
+        try:
+            connector.create_table_if_not_exists(
+                table_name,
+                columns=[
+                    ColumnInfo("id", pa.string(), nullable=False),
+                    ColumnInfo("val", pa.int64()),
+                ],
+                pk_column="id",
+            )
+            first_write = pa.table({"id": ["a", "b"], "val": pa.array([1, 2], type=pa.int64())})
+            connector.upsert_records(table_name, first_write, id_column="id")
 
-        second_write = pa.table({"id": ["a", "c"], "val": pa.array([99, 3], type=pa.int64())})
-        connector.upsert_records(
-            table_name, second_write, id_column="id", skip_existing=True
-        )
+            second_write = pa.table({"id": ["a", "c"], "val": pa.array([99, 3], type=pa.int64())})
+            connector.upsert_records(
+                table_name, second_write, id_column="id", skip_existing=True
+            )
 
-        result = pa.Table.from_batches(
-            list(connector.iter_batches(f'SELECT * FROM "{table_name}"'))
-        )
-        ids = sorted(result.column("id").to_pylist())
-        assert ids == ["a", "b", "c"]
+            result = pa.Table.from_batches(
+                list(connector.iter_batches(f'SELECT * FROM "{table_name}"'))
+            )
+            ids = sorted(result.column("id").to_pylist())
+            assert ids == ["a", "b", "c"]
 
-        # "a" must not have been overwritten (skip_existing=True preserved original val=1)
-        a_mask = pc.equal(result.column("id"), pa.scalar("a"))
-        a_val = result.filter(a_mask).column("val")[0].as_py()
-        assert a_val == 1
+            # "a" must not have been overwritten (skip_existing=True preserved original val=1)
+            a_mask = pc.equal(result.column("id"), pa.scalar("a"))
+            a_val = result.filter(a_mask).column("val")[0].as_py()
+            assert a_val == 1
+        finally:
+            connector.delete_table(table_name)
 
     def test_connector_arrow_database_round_trip(self, connector):
         """ConnectorArrowDatabase: add_record → flush → get_record_by_id."""
+        # Use a unique path so each CI run creates a fresh table and never
+        # conflicts with tables left by earlier runs (e.g. with a different
+        # __record_id Arrow type from a schema-migration commit).
+        unique_suffix = uuid.uuid4().hex[:8]
+        path = ("spiraldb", f"integration_{unique_suffix}")
+        # Table name mirrors ConnectorArrowDatabase._path_to_table_name logic.
+        table_name = f"spiraldb__integration_{unique_suffix}"
         db = ConnectorArrowDatabase(connector)
         record = pa.table({"x": pa.array([42], type=pa.int64())})
-        db.add_record(
-            ("spiraldb", "integration"),
-            record_id="test_r1",
-            record=record,
-            flush=True,
+        try:
+            db.add_record(
+                path,
+                record_id=b"test_r1",
+                record=record,
+                flush=True,
+            )
+            result = db.get_record_by_id(path, b"test_r1")
+            assert result is not None
+            assert result.column("x")[0].as_py() == 42
+        finally:
+            connector.delete_table(table_name)
+
+
+class TestArrowMetadataRoundTrip:
+    """Integration tests for Arrow metadata preservation across write→read cycles.
+
+    Requires ``SPIRAL_INTEGRATION_TESTS=1`` and valid SpiralDB credentials.
+    """
+
+    def test_schema_metadata_round_trip(self, connector):
+        """Schema-level metadata survives a full write→read cycle."""
+        table_name = _unique_table("schema_meta")
+        schema = pa.schema(
+            [
+                pa.field("__record_id", pa.string(), nullable=False),
+                pa.field("value", pa.float64()),
+            ],
+            metadata={b"origin": b"test-suite", b"version": b"1"},
         )
-        result = db.get_record_by_id(("spiraldb", "integration"), "test_r1")
-        assert result is not None
-        assert result.column("x")[0].as_py() == 42
+        records = pa.table(
+            {"__record_id": pa.array(["r1"]), "value": pa.array([1.0])},
+            schema=schema,
+        )
+        try:
+            connector.create_table_if_not_exists(
+                table_name,
+                columns=[
+                    ColumnInfo("__record_id", pa.string(), nullable=False),
+                    ColumnInfo("value", pa.float64()),
+                ],
+                pk_column="__record_id",
+            )
+            connector.upsert_records(table_name, records, id_column="__record_id")
+
+            batches = list(connector.iter_batches(f'SELECT * FROM "{table_name}"'))
+            result = pa.Table.from_batches(batches)
+            assert result.schema.metadata is not None
+            assert result.schema.metadata.get(b"origin") == b"test-suite"
+            assert result.schema.metadata.get(b"version") == b"1"
+        finally:
+            connector.delete_table(table_name)
+
+    def test_field_metadata_round_trip(self, connector):
+        """Per-column field metadata survives a full write→read cycle."""
+        table_name = _unique_table("field_meta")
+        schema = pa.schema([
+            pa.field("__record_id", pa.string(), nullable=False),
+            pa.field("value", pa.float64(), metadata={b"unit": b"meters", b"sensor": b"lidar"}),
+        ])
+        records = pa.table(
+            {"__record_id": pa.array(["r1"]), "value": pa.array([42.0])},
+            schema=schema,
+        )
+        try:
+            connector.create_table_if_not_exists(
+                table_name,
+                columns=[
+                    ColumnInfo("__record_id", pa.string(), nullable=False),
+                    ColumnInfo("value", pa.float64()),
+                ],
+                pk_column="__record_id",
+            )
+            connector.upsert_records(table_name, records, id_column="__record_id")
+
+            batches = list(connector.iter_batches(f'SELECT * FROM "{table_name}"'))
+            result = pa.Table.from_batches(batches)
+            value_meta = result.schema.field("value").metadata
+            assert value_meta is not None
+            assert value_meta.get(b"unit") == b"meters"
+            assert value_meta.get(b"sensor") == b"lidar"
+        finally:
+            connector.delete_table(table_name)
+
+    def test_extension_type_metadata_round_trip(self, connector):
+        """ARROW:extension:name / ARROW:extension:metadata field metadata survives."""
+        table_name = _unique_table("ext_meta")
+        ext_field = pa.field(
+            "path_col",
+            pa.large_string(),
+            metadata={
+                b"ARROW:extension:name": b"orcapod.path",
+                b"ARROW:extension:metadata": b"",
+            },
+        )
+        schema = pa.schema([
+            pa.field("__record_id", pa.string(), nullable=False),
+            ext_field,
+        ])
+        records = pa.table(
+            {
+                "__record_id": pa.array(["r1"]),
+                "path_col": pa.array(["/tmp/test"], type=pa.large_string()),
+            },
+            schema=schema,
+        )
+        try:
+            connector.create_table_if_not_exists(
+                table_name,
+                columns=[
+                    ColumnInfo("__record_id", pa.string(), nullable=False),
+                    ColumnInfo("path_col", pa.large_string()),
+                ],
+                pk_column="__record_id",
+            )
+            connector.upsert_records(table_name, records, id_column="__record_id")
+
+            batches = list(connector.iter_batches(f'SELECT * FROM "{table_name}"'))
+            result = pa.Table.from_batches(batches)
+            meta = result.schema.field("path_col").metadata
+            assert meta is not None
+            assert meta.get(b"ARROW:extension:name") == b"orcapod.path"
+        finally:
+            connector.delete_table(table_name)
+
+    def test_no_metadata_backward_compatible(self, connector):
+        """Plain tables with no Arrow metadata read back without spurious KV entries."""
+        table_name = _unique_table("no_meta")
+        try:
+            connector.create_table_if_not_exists(
+                table_name,
+                columns=[
+                    ColumnInfo("__record_id", pa.string(), nullable=False),
+                    ColumnInfo("value", pa.int64()),
+                ],
+                pk_column="__record_id",
+            )
+            records = pa.table({
+                "__record_id": pa.array(["r1"]),
+                "value": pa.array([99], type=pa.int64()),
+            })
+            connector.upsert_records(table_name, records, id_column="__record_id")
+
+            batches = list(connector.iter_batches(f'SELECT * FROM "{table_name}"'))
+            result = pa.Table.from_batches(batches)
+            assert result.schema.metadata is None
+            for field in result.schema:
+                assert field.metadata is None
+        finally:
+            connector.delete_table(table_name)
+
+    def test_connector_arrow_database_extension_type_round_trip(self, connector):
+        """Full ConnectorArrowDatabase path: write extension-typed column, read back intact."""
+        unique_suffix = uuid.uuid4().hex[:8]
+        path = ("spiraldb", f"ext_roundtrip_{unique_suffix}")
+        table_name = f"spiraldb__ext_roundtrip_{unique_suffix}"
+
+        ext_field = pa.field(
+            "path_col",
+            pa.large_string(),
+            metadata={
+                b"ARROW:extension:name": b"orcapod.path",
+                b"ARROW:extension:metadata": b"",
+            },
+        )
+        schema = pa.schema([pa.field("__record_id", pa.large_binary()), ext_field])
+        record = pa.table(
+            {
+                "__record_id": pa.array([b"test_r1"], type=pa.large_binary()),
+                "path_col": pa.array(["/data/file.npy"], type=pa.large_string()),
+            },
+            schema=schema,
+        )
+
+        db = ConnectorArrowDatabase(connector)
+        try:
+            db.add_record(path, record_id=b"test_r1", record=record, flush=True)
+            result = db.get_record_by_id(path, b"test_r1")
+            assert result is not None
+            meta = result.schema.field("path_col").metadata
+            assert meta is not None
+            assert meta.get(b"ARROW:extension:name") == b"orcapod.path"
+        finally:
+            connector.delete_table(table_name)
+
+    def test_nested_struct_field_metadata_round_trip(self, connector):
+        """Struct columns with inner-field metadata survive a full write→read cycle."""
+        table_name = _unique_table("struct_meta")
+        inner_field = pa.field("val", pa.float64(), metadata={b"unit": b"volts"})
+        struct_col = pa.field("measurement", pa.struct([inner_field]))
+        schema = pa.schema([
+            pa.field("__record_id", pa.string(), nullable=False),
+            struct_col,
+        ])
+        records = pa.table(
+            {
+                "__record_id": pa.array(["r1"]),
+                "measurement": pa.array(
+                    [{"val": 3.14}],
+                    type=pa.struct([pa.field("val", pa.float64())]),
+                ),
+            },
+            schema=schema,
+        )
+        try:
+            connector.create_table_if_not_exists(
+                table_name,
+                columns=[
+                    ColumnInfo("__record_id", pa.string(), nullable=False),
+                    ColumnInfo("measurement", pa.struct([pa.field("val", pa.float64())])),
+                ],
+                pk_column="__record_id",
+            )
+            connector.upsert_records(table_name, records, id_column="__record_id")
+
+            batches = list(connector.iter_batches(f'SELECT * FROM "{table_name}"'))
+            result = pa.Table.from_batches(batches)
+            inner = result.schema.field("measurement").type.field("val")
+            assert inner.metadata is not None
+            assert inner.metadata.get(b"unit") == b"volts"
+        finally:
+            connector.delete_table(table_name)

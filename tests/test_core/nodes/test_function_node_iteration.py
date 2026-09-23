@@ -13,6 +13,7 @@ import pytest
 
 from orcapod.core.function_pod import FunctionPod
 from orcapod.core.nodes import FunctionNode
+from orcapod.core.nodes.function_node import FunctionJobNode
 from orcapod.core.data_function import PythonDataFunction
 from orcapod.core.sources import ArrowTableSource
 from orcapod.databases import InMemoryArrowDatabase
@@ -35,14 +36,14 @@ def _make_source(n: int = 3) -> ArrowTableSource:
     return ArrowTableSource(table, tag_columns=["id"])
 
 
-def _make_node(n: int = 3, db: InMemoryArrowDatabase | None = None) -> FunctionNode:
+def _make_node(n: int = 3, db: InMemoryArrowDatabase | None = None) -> FunctionJobNode:
     def double(x: int) -> int:
         return x * 2
 
     pf = PythonDataFunction(double, output_keys="result")
     pod = FunctionPod(pf)
     pipeline_db = db if db is not None else InMemoryArrowDatabase()
-    return FunctionNode(pod, _make_source(n=n), pipeline_database=pipeline_db)
+    return FunctionJobNode(pod, _make_source(n=n), pipeline_database=pipeline_db)
 
 
 class TestIterDatasReadOnly:
@@ -95,13 +96,14 @@ class TestIterDatasReadOnly:
             assert mock_load.call_count <= 1  # at most one DB query
         assert first == second
 
-    def test_cached_output_datas_keyed_by_entry_id_strings(self):
-        """After run(), _cached_output_datas keys are entry_id strings, not ints."""
+    def test_cached_output_datas_keyed_by_entry_id_bytes(self):
+        """After run(), _cached_output_datas keys are entry_id bytes (method-prefixed digest)."""
         node = _make_node()
         node.run()
         assert len(node._cached_output_datas) == 3
         for key in node._cached_output_datas:
-            assert isinstance(key, str), f"Expected str key, got {type(key)}: {key!r}"
+            assert isinstance(key, bytes), f"Expected bytes key, got {type(key)}: {key!r}"
+            assert b":" in key, f"Entry ID bytes should be method-prefixed, got {key!r}"
 
     def test_as_table_fresh_node_returns_empty_no_compute(self):
         """as_table() on a fresh node with no run() and empty DB returns empty table."""
@@ -111,6 +113,8 @@ class TestIterDatasReadOnly:
             mock_proc.assert_not_called()
         assert isinstance(table, pa.Table)
         assert len(table) == 0
+        assert "id" in table.column_names
+        assert "result" in table.column_names
 
     def test_run_cache_only_is_noop(self):
         """run() on a CACHE_ONLY node returns without error and without computation."""
@@ -149,7 +153,7 @@ class TestIterDatasReadOnly:
         pf.executor = LocalPythonFunctionExecutor()  # supports_concurrent_execution is False
         pod = FunctionPod(pf)
         db = InMemoryArrowDatabase()
-        node = FunctionNode(pod, _make_source(n=3), pipeline_database=db)
+        node = FunctionJobNode(pod, _make_source(n=3), pipeline_database=db)
 
         from orcapod.pipeline.observer import NoOpObserver
 
@@ -162,3 +166,25 @@ class TestIterDatasReadOnly:
         assert isinstance(errors[0], ValueError)
         # Two non-failing data should succeed
         assert len(results) == 2
+
+
+def test_as_table_empty_schema_matches_non_empty_schema():
+    """as_table() empty table has the same columns and nullability as the populated table."""
+    db = InMemoryArrowDatabase()
+    node_after = _make_node(db=db)
+    node_after.run()
+    full_table = node_after.as_table()
+
+    node_before = _make_node()
+    empty_table = node_before.as_table()
+
+    assert empty_table.num_rows == 0
+    assert full_table.num_rows > 0
+    assert set(empty_table.column_names) == set(full_table.column_names)
+    # Nullability must match — this fails before the fix
+    assert all(
+        empty_table.schema.field(n).nullable == full_table.schema.field(n).nullable
+        for n in empty_table.column_names
+    )
+
+

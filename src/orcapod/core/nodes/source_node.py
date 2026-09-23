@@ -1,221 +1,165 @@
-"""SourceNode — wraps a root source stream in the computation graph."""
+"""Source node hierarchy for Pipeline and PipelineJob.
 
+SourceNode — schema-only input-slot declaration.
+SourceJobNode — execution variant that wraps a concrete StreamProtocol.
+Both share SourceNodeBase which provides schema-based identity.
+"""
 from __future__ import annotations
 
+import functools
 import logging
-from collections.abc import Iterator
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Iterator
 from typing import TYPE_CHECKING, Any
 
-logger = logging.getLogger(__name__)
-
 from orcapod import contexts
-from orcapod.channels import WritableChannel
-from orcapod.config import Config, DEFAULT_CONFIG
-from orcapod.core.streams.base import StreamBase
-from orcapod.protocols import core_protocols as cp
-from orcapod.types import ColumnConfig, ContentHash, Schema
+from orcapod.config import OrcapodConfig
+from orcapod.core.base import TraceableBase
+from orcapod.errors import SourceSpecMismatchError, UnboundSourceError
+from orcapod.protocols.core_protocols import DataProtocol, TagProtocol
+from orcapod.types import ColumnConfig, Schema
+from orcapod.utils.arrow_utils import system_tag_column_names
+from orcapod.utils.schema_utils import compute_source_schema_hash
 
 if TYPE_CHECKING:
     import pyarrow as pa
 
+    from orcapod.channels import WritableChannel
+    from orcapod.protocols.core_protocols import StreamProtocol
     from orcapod.protocols.observability_protocols import ExecutionObserverProtocol
 
+logger = logging.getLogger(__name__)
 
-class SourceNode(StreamBase):
-    """Represents a root source stream in the computation graph."""
+
+class SourceNodeBase(TraceableBase, ABC):
+    """Abstract base for SourceNode and SourceJobNode.
+
+    Provides schema-based identity (content_hash, pipeline_hash) and
+    shared properties.  Both sub-types carry identical schemas so their
+    pipeline_hash() values always match; content_hash() diverges only
+    when SourceJobNode has a concrete source bound.
+
+    Args:
+        name: The input-slot name used as the key in
+            ``PipelineJob.bind(sources={name: source})``.
+        tag_schema: Mapping of tag column names to Python types.
+        data_schema: Mapping of data column names to Python types.
+        data_context: Optional data context override.
+        label: Optional display label override.
+        config: Optional config override.
+    """
 
     node_type = "source"
 
     def __init__(
         self,
-        stream: cp.StreamProtocol,
+        name: str,
+        tag_schema: Schema,
+        data_schema: Schema,
+        data_context: str | contexts.DataContext | None = None,
         label: str | None = None,
-        config: Config | None = None,
-    ):
-        super().__init__(label=label, config=config)
-        self.stream = stream
-        self._cached_results: list[tuple[cp.TagProtocol, cp.DataProtocol]] | None = (
-            None
-        )
+        config: OrcapodConfig | None = None,
+    ) -> None:
+        super().__init__(label=label, data_context=data_context, config=config)
+        self._name = name
+        self._tag_schema = tag_schema
+        self._data_schema = data_schema
 
     # ------------------------------------------------------------------
-    # from_descriptor — reconstruct from a serialized pipeline descriptor
+    # Identity
     # ------------------------------------------------------------------
 
-    @classmethod
-    def from_descriptor(
-        cls,
-        descriptor: dict[str, Any],
-        stream: cp.StreamProtocol | None,
-        databases: dict[str, Any],
-    ) -> SourceNode:
-        """Construct a SourceNode from a serialized descriptor.
+    def identity_structure(self) -> Any:
+        """Return the content identity: ``("source_node", name, tag_schema, data_schema)``."""
+        return ("source_node", self._name, self._tag_schema, self._data_schema)
 
-        When *stream* is provided the node operates in full mode — all
-        delegation goes through the live stream.  When *stream* is ``None``
-        the node is created in read-only mode with metadata from the
-        descriptor; data-access methods (``iter_data``, ``as_table``)
-        will raise ``RuntimeError``.
+    def pipeline_identity_structure(self) -> Any:
+        """Return the pipeline identity: ``(tag_schema, data_schema)`` (name-independent).
 
-        Args:
-            descriptor: The serialized node descriptor dict.
-            stream: An optional live stream to wrap.  ``None`` for
-                read-only mode.
-            databases: Mapping of database role names to database
-                instances (currently unused for source nodes but kept
-                for interface consistency with other node types).
+        Sources with identical schemas share the same DB table paths regardless
+        of name.
+        """
+        return (self._tag_schema, self._data_schema)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        """The input-slot name used as the key in ``PipelineJob.bind(sources={...})``."""
+        return self._name
+
+    def computed_label(self) -> str | None:
+        """Resolve the node label to the slot name.
+
+        Implements ``LabelableMixin.computed_label()`` so that ``self.label``
+        resolves to the slot name without an explicit label assignment.
 
         Returns:
-            A new ``SourceNode`` instance.
+            The slot name.
         """
-        from orcapod.pipeline.serialization import LoadStatus
+        return self.name
 
-        if stream is not None:
-            node = cls(stream=stream, label=descriptor.get("label"))
-            node._descriptor = descriptor
-            node._load_status = LoadStatus.FULL
-            return node
+    @property
+    def tag_schema(self) -> Schema:
+        """Tag schema for this input slot."""
+        return self._tag_schema
 
-        # Read-only mode: bypass __init__, set minimum required state
-        node = cls.__new__(cls)
+    @property
+    def data_schema(self) -> Schema:
+        """Data schema for this input slot."""
+        return self._data_schema
 
-        # From LabelableMixin
-        node._label = descriptor.get("label")
+    @functools.cached_property
+    def _schema_hash_str(self) -> str:
+        """Cached schema hash used for system-tag column naming.
 
-        # From DataContextMixin
-        node._data_context = contexts.resolve_context(
-            descriptor.get("data_context_key")
+        Produces the same hash that ``SourceStreamBuilder`` embeds in system-tag
+        column names, making it possible to predict those names from the declared
+        schemas alone without requiring a live source. Computed once and cached
+        since ``_tag_schema`` and ``_data_schema`` are immutable after construction.
+
+        Returns:
+            Hex string schema hash.
+        """
+        return compute_source_schema_hash(
+            self._tag_schema,
+            self._data_schema,
+            self.data_context,
+            self.orcapod_config,
         )
-        node._orcapod_config = DEFAULT_CONFIG
-
-        # From ContentIdentifiableBase
-        node._content_hash_cache = {}
-        node._cached_int_hash = None
-
-        # From PipelineElementBase
-        node._pipeline_hash_cache = {}
-
-        # From TemporalMixin
-        node._modified_time = None
-
-        # SourceNode's own state
-        node.stream = None
-        node._cached_results = None
-        node._descriptor = descriptor
-        node._load_status = LoadStatus.UNAVAILABLE
-        node._stored_schema = descriptor.get("output_schema", {})
-        node._stored_content_hash = descriptor.get("content_hash")
-        node._stored_pipeline_hash = descriptor.get("pipeline_hash")
-        node._stored_node_uri = tuple(descriptor.get("node_uri") or [])
-
-        return node
-
-    # ------------------------------------------------------------------
-    # node_uri
-    # ------------------------------------------------------------------
 
     @property
     def node_uri(self) -> tuple[str, ...]:
-        """Canonical URI tuple identifying this source.
+        """Canonical URI tuple for this source node.
 
-        At runtime: derives from stream config (source_type, source_id).
-        In read-only (deserialized) mode: returns stored value from descriptor.
+        Returns a tuple identifying this node as a named schema-only source slot.
         """
-        if self.stream is None:
-            uri = tuple(getattr(self, "_stored_node_uri", ()))
-            logger.debug("SourceNode.node_uri: read-only mode, returning stored URI %r", uri)
-            return uri
-        stream = self.stream
-        if hasattr(stream, "to_config"):
-            cfg = stream.to_config()
-            stream_type = cfg.get("source_type", "unknown")
-            source_id = cfg.get("source_id") or getattr(stream, "source_id", "")
-            uri = (stream_type, str(source_id or ""))
-            logger.debug("SourceNode.node_uri: live stream, derived URI %r from to_config()", uri)
-            return uri
-        uri = (type(stream).__name__,)
-        logger.debug("SourceNode.node_uri: live stream without to_config, using type name %r", uri)
-        return uri
-
-    # ------------------------------------------------------------------
-    # load_status
-    # ------------------------------------------------------------------
+        return ("source_node", self._name)
 
     @property
-    def load_status(self) -> Any:
-        """Return the load status of this node.
+    def producer(self) -> None:
+        """Source nodes have no producer pod — they are root nodes.
 
         Returns:
-            The ``LoadStatus`` enum value indicating how this node was
-            loaded.  Defaults to ``FULL`` for nodes created via
-            ``__init__``.
+            Always ``None``.
         """
-        from orcapod.pipeline.serialization import LoadStatus
-
-        return getattr(self, "_load_status", LoadStatus.FULL)
-
-    # ------------------------------------------------------------------
-    # Delegation — with read-only guards
-    # ------------------------------------------------------------------
+        return None
 
     @property
-    def data_context(self) -> contexts.DataContext:
-        if self.stream is None:
-            return self._data_context
-        return contexts.resolve_context(self.stream.data_context_key)
+    def upstreams(self) -> "tuple[StreamProtocol, ...]":
+        """Source nodes have no upstream streams — they are root nodes.
 
-    @property
-    def data_context_key(self) -> str:
-        if self.stream is None:
-            return self._data_context.context_key
-        return self.stream.data_context_key
+        Returns:
+            Always an empty tuple.
+        """
+        return ()
 
-    def computed_label(self) -> str | None:
-        if self.stream is None:
-            return None
-        return self.stream.label
-
-    def identity_structure(self) -> Any:
-        if self.stream is None:
-            raise RuntimeError(
-                "SourceNode in read-only mode has no stream data available"
-            )
-        # TODO: revisit this logic for case where stream is not a root source
-        return self.stream.identity_structure()
-
-    def pipeline_identity_structure(self) -> Any:
-        if self.stream is None:
-            raise RuntimeError(
-                "SourceNode in read-only mode has no stream data available"
-            )
-        return self.stream.pipeline_identity_structure()
-
-    def content_hash(self, hasher=None) -> ContentHash:
-        """Return the content hash, using stored value in read-only mode."""
-        stored = getattr(self, "_stored_content_hash", None)
-        if self.stream is None and stored is not None:
-            return ContentHash.from_string(stored)
-        return super().content_hash(hasher)
-
-    def pipeline_hash(self, hasher=None) -> ContentHash:
-        """Return the pipeline hash, using stored value in read-only mode."""
-        stored = getattr(self, "_stored_pipeline_hash", None)
-        if self.stream is None and stored is not None:
-            return ContentHash.from_string(stored)
-        return super().pipeline_hash(hasher)
-
-    def keys(
-        self,
-        *,
-        columns: ColumnConfig | dict[str, Any] | None = None,
-        all_info: bool = False,
-    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        if self.stream is None:
-            stored = getattr(self, "_stored_schema", {})
-            tag_keys = tuple(stored.get("tag", {}).keys())
-            data_keys = tuple(stored.get("data", {}).keys())
-            return tag_keys, data_keys
-        return self.stream.keys(columns=columns, all_info=all_info)
+    @upstreams.setter
+    def upstreams(self, value: "tuple[StreamProtocol, ...]") -> None:
+        if len(value) != 0:
+            raise ValueError("SourceNode upstreams must be empty")
 
     def output_schema(
         self,
@@ -223,28 +167,100 @@ class SourceNode(StreamBase):
         columns: ColumnConfig | dict[str, Any] | None = None,
         all_info: bool = False,
     ) -> tuple[Schema, Schema]:
-        if self.stream is None:
-            stored = getattr(self, "_stored_schema", {})
-            tag = Schema(stored.get("tag", {}))
-            data = Schema(stored.get("data", {}))
-            return tag, data
-        return self.stream.output_schema(columns=columns, all_info=all_info)
+        """Return ``(tag_schema, data_schema)``.
 
-    @property
-    def producer(self) -> None:
-        return None
+        When ``columns.system_tags`` is ``True`` (or ``all_info=True``), the
+        returned tag schema is extended with the two system-tag entries for this
+        node's schema (both typed as ``str``). Their names are deterministic from
+        the declared schemas and match what a concrete source with the same schema
+        would produce.
 
-    @property
-    def upstreams(self) -> tuple[cp.StreamProtocol, ...]:
-        return ()
+        Other ``ColumnConfig`` flags (``meta``, ``context``, ``source``,
+        ``content_hash``, ``sort_by_tags``) are no-ops at the node level —
+        consistent with ``ArrowTableStream.output_schema()`` which also ignores them.
 
-    @upstreams.setter
-    def upstreams(self, value: tuple[cp.StreamProtocol, ...]) -> None:
-        if len(value) != 0:
-            raise ValueError("SourceNode upstreams must be empty")
+        Args:
+            columns: Column selection config.
+            all_info: If ``True``, equivalent to ``ColumnConfig(system_tags=True)``
+                for this method.
 
-    def __repr__(self) -> str:
-        return f"SourceNode(stream={self.stream!r}, label={self.label!r})"
+        Returns:
+            Tuple of ``(tag_schema, data_schema)``.
+        """
+        columns_config = ColumnConfig.handle_config(columns, all_info=all_info)
+        tag_schema = self._tag_schema
+        if columns_config.system_tags:
+            source_id_col, record_id_col = system_tag_column_names(self._schema_hash_str)
+            tag_schema = Schema(
+                {**dict(tag_schema), source_id_col: str, record_id_col: str}
+            )
+        return tag_schema, self._data_schema
+
+    def keys(
+        self,
+        *,
+        columns: ColumnConfig | dict[str, Any] | None = None,
+        all_info: bool = False,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Return ``(tag_keys, data_keys)``.
+
+        Derived from ``output_schema()`` to ensure the two methods are always
+        consistent. See ``output_schema()`` for the full description of which
+        ``ColumnConfig`` flags are honoured at the node level.
+
+        Args:
+            columns: Column selection config.
+            all_info: If ``True``, include all available column groups.
+
+        Returns:
+            Tuple of ``(tag_column_names, data_column_names)``.
+        """
+        tag_schema, data_schema = self.output_schema(columns=columns, all_info=all_info)
+        return tuple(tag_schema.keys()), tuple(data_schema.keys())
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def validate(self, source: "StreamProtocol") -> None:
+        """Check that *source* is schema-compatible with this node's declared schema.
+
+        Args:
+            source: A concrete stream to validate.
+
+        Raises:
+            SourceSpecMismatchError: If schema columns don't match.
+        """
+        source_tag, source_data = source.output_schema()
+
+        tag_issues: list[str] = []
+        data_issues: list[str] = []
+
+        spec_tag_cols = set(self._tag_schema.keys())
+        src_tag_cols = set(source_tag.keys())
+        if spec_tag_cols != src_tag_cols:
+            missing = spec_tag_cols - src_tag_cols
+            extra = src_tag_cols - spec_tag_cols
+            if missing:
+                tag_issues.append(f"missing tag columns: {sorted(missing)}")
+            if extra:
+                tag_issues.append(f"unexpected tag columns: {sorted(extra)}")
+
+        spec_data_cols = set(self._data_schema.keys())
+        src_data_cols = set(source_data.keys())
+        if spec_data_cols != src_data_cols:
+            missing = spec_data_cols - src_data_cols
+            extra = src_data_cols - spec_data_cols
+            if missing:
+                data_issues.append(f"missing data columns: {sorted(missing)}")
+            if extra:
+                data_issues.append(f"unexpected data columns: {sorted(extra)}")
+
+        if tag_issues or data_issues:
+            raise SourceSpecMismatchError(
+                f"SourceNode '{self._name}' is not compatible with the provided source. "
+                + "; ".join(tag_issues + data_issues)
+            )
 
     def as_table(
         self,
@@ -252,75 +268,456 @@ class SourceNode(StreamBase):
         columns: ColumnConfig | dict[str, Any] | None = None,
         all_info: bool = False,
     ) -> pa.Table:
-        if self.stream is None:
-            raise RuntimeError(
-                "SourceNode in read-only mode has no stream data available"
-            )
-        return self.stream.as_table(columns=columns, all_info=all_info)
+        """Materialize stream as a PyArrow Table.
 
-    def iter_data(self) -> Iterator[tuple[cp.TagProtocol, cp.DataProtocol]]:
-        if self.stream is None:
-            raise RuntimeError(
-                "SourceNode in read-only mode has no stream data available"
-            )
-        if self._cached_results is not None:
-            return iter(self._cached_results)
-        return self.stream.iter_data()
+        Delegates to the concrete source (SourceJobNode), or raises for
+        schema-only SourceNode.
+
+        Args:
+            columns: Column selection config.
+            all_info: If True, include all metadata columns.
+
+        Raises:
+            UnboundSourceError: When no concrete data is available.
+        """
+        # Calling iter_data() will raise UnboundSourceError for SourceNode,
+        # or delegate to concrete for SourceJobNode.
+        # For SourceJobNode with a concrete source, delegate directly.
+        raise UnboundSourceError(
+            f"SourceNode '{self._name}' is not bound to a concrete source. "
+            "Use PipelineJob.bind() to attach data before calling as_table()."
+        )
+
+    async def async_iter_data(self):
+        """Asynchronous iterator over (tag, data) pairs.
+
+        Yields:
+            tuple[TagProtocol, DataProtocol]: A ``(tag, data)`` pair from the
+            concrete source.  Raises before yielding anything when unbound.
+
+        Raises:
+            UnboundSourceError: When no concrete data is available.
+        """
+        for pair in self.iter_data():
+            yield pair
+
+    # ------------------------------------------------------------------
+    # Abstract
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def iter_data(self) -> Iterator[tuple[TagProtocol, DataProtocol]]:
+        """Yield ``(tag, data)`` pairs, or raise if data is unavailable."""
+        ...
 
     def execute(
         self,
         *,
         observer: ExecutionObserverProtocol | None = None,
-    ) -> list[tuple[cp.TagProtocol, cp.DataProtocol]]:
-        """Execute this source: materialize data and return.
+    ) -> list[tuple[TagProtocol, DataProtocol]]:
+        """Execute this source node: materialize and return data.
 
         Args:
-            observer: Optional execution observer for hooks.
+            observer: Optional execution observer.
 
         Returns:
             List of (tag, data) tuples.
+
+        Raises:
+            UnboundSourceError: When no concrete data is available.
         """
-        if self.stream is None:
-            raise RuntimeError(
-                "SourceNode in read-only mode has no stream data available"
-            )
         node_label = self.label
-        node_hash = ""
+        node_hash = self.content_hash().to_string()
         if observer is not None:
             observer.on_node_start(node_label, node_hash)
-        result = list(self.stream.iter_data())
-        self._cached_results = result
+        result = list(self.iter_data())
         if observer is not None:
             observer.on_node_end(node_label, node_hash)
         return result
 
-    def run(self) -> None:
-        """No-op for source nodes — data is already available."""
-
     async def async_execute(
         self,
-        output: WritableChannel[tuple[cp.TagProtocol, cp.DataProtocol]],
+        output: "WritableChannel[tuple[TagProtocol, DataProtocol]]",
         *,
         observer: ExecutionObserverProtocol | None = None,
     ) -> None:
-        """Push all (tag, data) pairs from the wrapped stream to the output channel.
+        """Push all (tag, data) pairs to the output channel.
+
+        Delegates to ``async_iter_data`` so that dynamic sources
+        (e.g. ``PollingSource``) stream continuously without modification
+        to this node.
 
         Args:
             output: Channel to write results to.
-            observer: Optional execution observer for hooks.
+            observer: Optional execution observer.
+
+        Raises:
+            UnboundSourceError: When no concrete data is available.
         """
-        if self.stream is None:
-            raise RuntimeError(
-                "SourceNode in read-only mode has no stream data available"
-            )
         node_label = self.label
-        node_hash = ""
+        node_hash = self.content_hash().to_string()
         try:
             if observer is not None:
                 observer.on_node_start(node_label, node_hash)
-            for tag, data in self.stream.iter_data():
+            async for tag, data in self.async_iter_data():
                 await output.send((tag, data))
             if observer is not None:
                 observer.on_node_end(node_label, node_hash)
         finally:
             await output.close()
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(name={self._name!r}, "
+            f"tag_schema={dict(self._tag_schema)!r}, "
+            f"data_schema={dict(self._data_schema)!r})"
+        )
+
+
+class SourceNode(SourceNodeBase):
+    """Schema-only input-slot declaration for ``Pipeline`` recording.
+
+    Replaces ``SourceSpec`` as the user-facing way to declare typed pipeline
+    inputs.  Pass a ``SourceNode`` inside a ``with pipeline:`` block as the
+    upstream for any pod invocation.
+
+    Example::
+
+        slot = SourceNode(name="data", tag_schema={"id": int}, data_schema={"v": float})
+        with pipeline:
+            result = my_pod(slot)
+
+        job = PipelineJob.from_pipeline(pipeline, store=db, sources={"data": my_source})
+        job.run()
+
+    Hash-stability note:
+        ``identity_structure()`` returns ``("SourceSpec", name, tag_schema, data_schema)``
+        — identical to the old ``SourceSpec`` — so existing DB paths remain valid.
+    """
+
+    def iter_data(self) -> Iterator[tuple[TagProtocol, DataProtocol]]:
+        """Raise ``UnboundSourceError`` — ``SourceNode`` carries no data.
+
+        Raises:
+            UnboundSourceError: Always.
+        """
+        raise UnboundSourceError(
+            f"SourceNode '{self._name}' is not bound to a concrete source. "
+            "Use PipelineJob.from_pipeline(..., sources={'<name>': source}) "
+            "or job.bind(sources={'<name>': source}) to attach data."
+        )
+
+    @classmethod
+    def from_stream(
+        cls,
+        stream: StreamProtocol,
+        name: str | None = None,
+    ) -> SourceNode:
+        """Wrap *stream* in a ``SourceNode``, or return it unchanged if already one.
+
+        Derives tag and data schemas from ``stream.output_schema()``.  The slot
+        name is resolved in priority order:
+
+        1. *name* parameter (explicit override — highest priority).
+        2. ``stream.source_id`` when *stream* is a ``RootSource`` — the canonical
+           source identity, stable across pipeline serialisation / deserialisation.
+        3. ``"{stream.label}:{hash_prefix}"`` for any other concrete stream type,
+           combining the cosmetic label with a short content-hash suffix to ensure
+           uniqueness.
+
+        Args:
+            stream: The upstream stream to wrap.
+            name: Optional explicit slot name.
+
+        Returns:
+            The original *stream* if it is already a ``SourceNode``; otherwise
+            a new ``SourceNode`` with schemas derived from *stream*.
+        """
+        if isinstance(stream, SourceNode):
+            return stream
+        tag_schema, data_schema = stream.output_schema()
+        if name is not None:
+            slot_name = name
+        else:
+            # Local import avoids a module-level circular dependency between
+            # core.nodes and core.sources.
+            from orcapod.core.sources.base import RootSource
+            if isinstance(stream, RootSource):
+                slot_name = stream.source_id
+            else:
+                slot_name = f"{stream.label}:{stream.content_hash().to_string()}"
+        return cls(
+            name=slot_name,
+            tag_schema=tag_schema,
+            data_schema=data_schema,
+        )
+
+
+class SourceJobNode(SourceNodeBase):
+    """Execution-ready source node wrapping an optional concrete stream.
+
+    Used inside ``PipelineJob._persistent_node_map``.  The ``_concrete``
+    field is **mutable** — ``PipelineJob.bind(sources={...})`` updates it
+    in-place so that downstream ``FunctionJobNode`` objects (which hold a
+    reference to this same object) automatically see the new concrete source
+    without cascading reference updates.
+
+    Hash behaviour:
+
+    * ``content_hash()`` — delegates to the bound source's
+      ``identity_structure()`` when bound (via ``identity_structure()``
+      override); falls back to schema-based identity when unbound.
+    * ``pipeline_hash()`` — always schema-based (inherited); never
+      data-inclusive.  This invariant keeps DB paths stable across different
+      data sources bound to the same slot.
+
+    Args:
+        name: Slot name.
+        tag_schema: Tag schema.  Optional when *bound_source* is provided;
+            inferred from ``bound_source.output_schema()`` when omitted.
+            Stored for future rebind validation.
+        data_schema: Data schema.  Optional when *bound_source* is provided;
+            inferred from ``bound_source.output_schema()`` when omitted.
+            Stored for future rebind validation.
+        bound_source: Optional concrete stream.  Can be set or replaced later
+            via ``job_node.bound_source = source``.
+        data_context: Optional data context override.
+
+    Raises:
+        ValueError: If both *tag_schema* and *data_schema* are omitted and
+            *bound_source* is ``None``.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        tag_schema: Schema | None = None,
+        data_schema: Schema | None = None,
+        bound_source: StreamProtocol | None = None,
+        data_context: str | contexts.DataContext | None = None,
+    ) -> None:
+        if tag_schema is None or data_schema is None:
+            if bound_source is None:
+                raise ValueError(
+                    "SourceJobNode requires either explicit tag_schema/data_schema "
+                    "or a bound_source to derive schemas from."
+                )
+            derived_tag, derived_data = bound_source.output_schema()
+            if tag_schema is None:
+                tag_schema = derived_tag
+            if data_schema is None:
+                data_schema = derived_data
+        super().__init__(
+            name=name,
+            tag_schema=tag_schema,
+            data_schema=data_schema,
+            data_context=data_context,
+        )
+        # Direct assignment to the backing attribute — super().__init__() has
+        # already initialised _content_hash_cache, so the property setter is
+        # safe to use here; we bypass it only to make the init path explicit.
+        self._bound_source: StreamProtocol | None = bound_source
+
+    # ------------------------------------------------------------------
+    # bound_source property — explicit binding with cache invalidation
+    # ------------------------------------------------------------------
+
+    @property
+    def bound_source(self) -> StreamProtocol | None:
+        """The concrete stream currently bound to this slot, or ``None``."""
+        return self._bound_source
+
+    @bound_source.setter
+    def bound_source(self, value: StreamProtocol | None) -> None:
+        """Bind *value* as the concrete source and invalidate both hash caches."""
+        self._bound_source = value
+        self._invalidate_content_hash_cache()
+        self._invalidate_pipeline_hash_cache()
+
+    # ------------------------------------------------------------------
+    # Identity — delegate to bound source when set
+    # ------------------------------------------------------------------
+
+    def identity_structure(self) -> Any:
+        """Delegate to ``bound_source.identity_structure()`` when bound.
+
+        This is the correct extension point: content_hash() flows from
+        identity_structure(), so overriding here avoids bypassing the
+        caching and resolver logic in ContentIdentifiableBase.content_hash().
+
+        Returns:
+            Bound source's identity structure when bound; schema-based
+            identity (inherited from SourceNodeBase) when unbound.
+        """
+        if self._bound_source is not None:
+            return self._bound_source.identity_structure()
+        return super().identity_structure()
+
+    def iter_data(self) -> Iterator[tuple[TagProtocol, DataProtocol]]:
+        """Delegate to concrete source, or raise if unbound.
+
+        Raises:
+            UnboundSourceError: When no concrete source is attached.
+        """
+        if self._bound_source is None:
+            raise UnboundSourceError(
+                f"SourceJobNode '{self._name}' has no concrete source bound. "
+                "Call job.bind(sources={'<name>': source}) before running."
+            )
+        return self._bound_source.iter_data()
+
+    async def async_iter_data(
+        self,
+    ) -> AsyncIterator[tuple[TagProtocol, DataProtocol]]:
+        """Delegate to ``bound_source.async_iter_data()`` when bound.
+
+        Overrides ``SourceNodeBase.async_iter_data()`` to route through the
+        bound source's own async generator instead of wrapping ``iter_data()``
+        synchronously. This ensures that dynamic sources such as
+        ``PollingSource`` run their async polling loop rather than returning
+        a static snapshot.
+
+        Raises:
+            UnboundSourceError: When no concrete source is attached.
+        """
+        if self._bound_source is None:
+            raise UnboundSourceError(
+                f"SourceJobNode '{self._name}' has no concrete source bound. "
+                "Call job.bind(sources={'<name>': source}) before running."
+            )
+        async for pair in self._bound_source.async_iter_data():
+            yield pair
+
+    def output_schema(
+        self,
+        *,
+        columns: ColumnConfig | dict[str, Any] | None = None,
+        all_info: bool = False,
+    ) -> tuple[Schema, Schema]:
+        """Return ``(tag_schema, data_schema)``, delegating to ``bound_source`` when set.
+
+        When ``bound_source`` is present, this is a transparent pass-through to
+        ``bound_source.output_schema(columns=columns, all_info=all_info)`` so callers
+        get the same result as querying the source directly.
+
+        When unbound, delegates to ``SourceNodeBase.output_schema()`` which includes
+        system-tag schema entries derived from the declared schemas.
+
+        Args:
+            columns: Column selection config.
+            all_info: If ``True``, include all available column groups.
+
+        Returns:
+            Tuple of ``(tag_schema, data_schema)``.
+        """
+        if self._bound_source is None:
+            return super().output_schema(columns=columns, all_info=all_info)
+        return self._bound_source.output_schema(columns=columns, all_info=all_info)
+
+    def as_table(
+        self,
+        *,
+        columns: ColumnConfig | dict[str, Any] | None = None,
+        all_info: bool = False,
+    ) -> pa.Table:
+        """Materialize the concrete source as a PyArrow Table.
+
+        Args:
+            columns: Column selection config.
+            all_info: If True, include all metadata columns.
+
+        Raises:
+            UnboundSourceError: When no concrete source is attached.
+        """
+        if self._bound_source is None:
+            raise UnboundSourceError(
+                f"SourceJobNode '{self._name}' has no concrete source bound. "
+                "Call job.bind(sources={'<name>': source}) before calling as_table()."
+            )
+        return self._bound_source.as_table(columns=columns, all_info=all_info)
+
+    @classmethod
+    def from_stream(
+        cls,
+        stream: StreamProtocol,
+        name: str | None = None,
+    ) -> "SourceJobNode":
+        """Create a ``SourceJobNode`` from *stream* using three-way logic.
+
+        The three cases are:
+
+        1. *stream* is already a ``SourceJobNode`` — copy it, preserving the
+           existing ``bound_source`` (the SJN itself is **not** used as the
+           bound source).
+        2. *stream* is a ``SourceNode`` (schema-only, no data) — create an
+           **unbound** ``SourceJobNode`` with the same name and schemas. The
+           resulting SJN has ``bound_source=None`` and the same
+           ``content_hash()`` as *stream* (schema-based).
+        3. Any other concrete stream (``ArrowTableSource``, etc.) — create a
+           **bound** ``SourceJobNode`` whose ``content_hash()`` delegates to
+           the concrete stream.
+
+        Args:
+            stream: The stream to wrap.
+            name: Optional explicit slot name. In all three cases, when *name*
+                is provided it takes precedence over the stream's own name.
+                For concrete streams (Case 3), when *name* is ``None`` the slot
+                name is resolved as: ``stream.source_id`` for ``RootSource``
+                instances, or ``"{stream.label}:{hash_prefix}"`` for any other
+                concrete stream type.
+
+        Returns:
+            A ``SourceJobNode`` configured according to the case above.
+        """
+        match stream:
+            case SourceJobNode():
+                # Case 1: copy — preserve bound_source, do NOT wrap the SJN itself.
+                return cls(
+                    name=name if name is not None else stream.name,
+                    tag_schema=stream.tag_schema,
+                    data_schema=stream.data_schema,
+                    bound_source=stream.bound_source,
+                )
+            case SourceNode():
+                # Case 2: unbound — schema placeholder; SJN hash = SourceNode hash.
+                return cls(
+                    name=name if name is not None else stream.name,
+                    tag_schema=stream.tag_schema,
+                    data_schema=stream.data_schema,
+                    bound_source=None,
+                )
+            case _:
+                # Case 3: concrete stream — bound SJN.
+                # Slot name priority:
+                #   1. explicit *name* parameter
+                #   2. stream.source_id for RootSource (canonical, stable identity)
+                #   3. label + short hash prefix for any other concrete stream type
+                tag_schema, data_schema = stream.output_schema()
+                if name is not None:
+                    slot_name = name
+                else:
+                    # Local import avoids a module-level circular dependency between
+                    # core.nodes and core.sources.
+                    from orcapod.core.sources.base import RootSource
+                    if isinstance(stream, RootSource):
+                        slot_name = stream.source_id
+                    else:
+                        slot_name = f"{stream.label}:{stream.content_hash().to_string()}"
+                return cls(
+                    name=slot_name,
+                    tag_schema=tag_schema,
+                    data_schema=data_schema,
+                    bound_source=stream,
+                )
+
+    def as_node(self) -> SourceNode:
+        """Return the lightweight ``SourceNode`` equivalent of this job node.
+
+        Returns:
+            A new ``SourceNode`` with the same name and schemas.
+        """
+        return SourceNode(
+            name=self._name,
+            tag_schema=self._tag_schema,
+            data_schema=self._data_schema,
+        )

@@ -206,7 +206,7 @@ class TestPipelineIntegration:
         from orcapod.core.data_function import PythonDataFunction
         from orcapod.core.sources import PostgreSQLTableSource
         from orcapod.databases import InMemoryArrowDatabase
-        from orcapod.pipeline import Pipeline
+        from orcapod.pipeline import PipelineJob
         from orcapod.pipeline.sync_orchestrator import SyncPipelineOrchestrator
 
         with psycopg.connect(schema_dsn) as conn:
@@ -228,14 +228,22 @@ class TestPipelineIntegration:
         pf = PythonDataFunction(double_response, output_keys="doubled")
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(
-            name="pg_integration", pipeline_database=InMemoryArrowDatabase()
-        )
-        with pipeline:
+        job = PipelineJob(name="pg_integration", store=InMemoryArrowDatabase())
+        with job:
             pod(src, label="doubler")
 
+        from orcapod.pipeline.dag import OrcaDAG
+        exec_dag: OrcaDAG = OrcaDAG()
+        for node in job._persistent_node_map.values():
+            exec_dag.add_node(node)
+        for u_hash, v_hash in job._graph_edges:
+            if u_hash in job._persistent_node_map and v_hash in job._persistent_node_map:
+                exec_dag.add_edge(
+                    job._persistent_node_map[u_hash],
+                    job._persistent_node_map[v_hash],
+                )
         orch = SyncPipelineOrchestrator()
-        result = orch.run(pipeline._node_graph)
+        result = orch.run(exec_dag)
 
         fn_outputs = [
             v for k, v in result.node_outputs.items() if k.node_type == "function"

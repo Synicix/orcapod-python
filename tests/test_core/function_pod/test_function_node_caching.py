@@ -18,6 +18,7 @@ from orcapod.core.cached_function_pod import CachedFunctionPod
 from orcapod.core.datagrams import Data, Tag
 from orcapod.core.function_pod import FunctionPod
 from orcapod.core.nodes import FunctionNode
+from orcapod.core.nodes.function_node import FunctionJobNode
 from orcapod.core.data_function import PythonDataFunction
 from orcapod.core.sources import ArrowTableSource
 from orcapod.core.streams.arrow_table_stream import ArrowTableStream
@@ -70,7 +71,7 @@ def _make_node(stream, db=None):
     pod = _make_pod()
     if db is None:
         db = InMemoryArrowDatabase()
-    return FunctionNode(
+    return FunctionJobNode(
         function_pod=pod,
         input_stream=stream,
         pipeline_database=db,
@@ -84,14 +85,16 @@ def _make_node(stream, db=None):
 
 
 class TestComputePipelineEntryId:
-    def test_returns_non_empty_string(self):
+    def test_returns_non_empty_bytes(self):
         stream = _make_stream([{"id": 0, "x": 10}])
         node, _ = _make_node(stream)
         tag = Tag({"id": 0})
         data = Data({"x": 10})
         entry_id = node.compute_pipeline_entry_id(tag, data)
-        assert isinstance(entry_id, str)
+        assert isinstance(entry_id, bytes)
         assert len(entry_id) > 0
+        # Must be method-prefixed: b"{method}:{raw_digest}"
+        assert b":" in entry_id
 
     def test_same_inputs_produce_same_id(self):
         stream = _make_stream([{"id": 0, "x": 10}])
@@ -164,14 +167,14 @@ class TestResultVsPipelineRecordCounts:
         node.run()
 
         # Result DB: 1 record (same data hash, second is cache hit)
-        result_records = node._cached_function_pod._result_database.get_all_records(
+        result_records = node._cached_function_pod.result_database.get_all_records(
             node._cached_function_pod.record_path
         )
         assert result_records is not None
         assert result_records.num_rows == 1
 
         # Pipeline DB: 2 records (different tags → different entry_ids)
-        pipeline_records = db.get_all_records(node.node_identity_path)
+        pipeline_records = db.get_all_records(node._versioned_pipeline_path)
         assert pipeline_records is not None
         assert pipeline_records.num_rows == 2
 
@@ -185,13 +188,13 @@ class TestResultVsPipelineRecordCounts:
         node, db = _make_node(stream)
         node.run()
 
-        result_records = node._cached_function_pod._result_database.get_all_records(
+        result_records = node._cached_function_pod.result_database.get_all_records(
             node._cached_function_pod.record_path
         )
         assert result_records is not None
         assert result_records.num_rows == 2
 
-        pipeline_records = db.get_all_records(node.node_identity_path)
+        pipeline_records = db.get_all_records(node._versioned_pipeline_path)
         assert pipeline_records is not None
         assert pipeline_records.num_rows == 2
 
@@ -202,13 +205,13 @@ class TestResultVsPipelineRecordCounts:
         node, db = _make_node(stream)
         node.run()
 
-        result_records = node._cached_function_pod._result_database.get_all_records(
+        result_records = node._cached_function_pod.result_database.get_all_records(
             node._cached_function_pod.record_path
         )
         assert result_records is not None
         assert result_records.num_rows == 1
 
-        pipeline_records = db.get_all_records(node.node_identity_path)
+        pipeline_records = db.get_all_records(node._versioned_pipeline_path)
         assert pipeline_records is not None
         assert pipeline_records.num_rows == 1
 
@@ -269,7 +272,7 @@ class TestPhase1Phase2PipelineEntryId:
         node1, _ = _make_node(stream1, db=db)
         node1.run()
 
-        pipeline_count_after_first = db.get_all_records(node1.node_identity_path).num_rows
+        pipeline_count_after_first = db.get_all_records(node1._versioned_pipeline_path).num_rows
         assert pipeline_count_after_first == 1
 
         # Second run: tag=1, x=10 (same data, different tag)
@@ -287,12 +290,12 @@ class TestPhase1Phase2PipelineEntryId:
         assert len(results) == 1
 
         # Shared table now has 2 records (one per node/content_hash)
-        all_pipeline_records = db.get_all_records(node2.node_identity_path)
+        all_pipeline_records = db.get_all_records(node2._versioned_pipeline_path)
         assert all_pipeline_records is not None
         assert all_pipeline_records.num_rows == 2
 
         # Result DB should still have only 1 record (same data hash, cache hit)
-        result_records = node2._cached_function_pod._result_database.get_all_records(
+        result_records = node2._cached_function_pod.result_database.get_all_records(
             node2._cached_function_pod.record_path
         )
         assert result_records is not None
@@ -311,13 +314,13 @@ class TestPhase1Phase2PipelineEntryId:
         stream2 = _make_stream([{"id": 0, "x": 10}, {"id": 1, "x": 20}])
         node2, _ = _make_node(stream2, db=db)
 
-        pipeline_count_before = db.get_all_records(node2.node_identity_path).num_rows
+        pipeline_count_before = db.get_all_records(node2._versioned_pipeline_path).num_rows
 
         results = list(node2.iter_data())
         assert len(results) == 2
 
         # No new pipeline records should be added
-        pipeline_count_after = db.get_all_records(node2.node_identity_path).num_rows
+        pipeline_count_after = db.get_all_records(node2._versioned_pipeline_path).num_rows
         assert pipeline_count_after == pipeline_count_before
 
 
@@ -356,7 +359,7 @@ class TestResultCacheHitPipelineNovel:
         node, _ = _make_node(stream, db=db)
         node.run()
 
-        pipeline_records = db.get_all_records(node.node_identity_path)
+        pipeline_records = db.get_all_records(node._versioned_pipeline_path)
         assert pipeline_records is not None
         assert pipeline_records.num_rows == 2
 
@@ -377,7 +380,7 @@ class TestPipelineRecordSourceColumns:
         node, db = _make_node(stream)
         node.run()
 
-        pipeline_records = db.get_all_records(node.node_identity_path)
+        pipeline_records = db.get_all_records(node._versioned_pipeline_path)
         assert pipeline_records is not None
 
         source_cols = [
@@ -393,9 +396,84 @@ class TestPipelineRecordSourceColumns:
         node, db = _make_node(stream)
         node.run()
 
-        pipeline_records = db.get_all_records(node.node_identity_path)
+        pipeline_records = db.get_all_records(node._versioned_pipeline_path)
         assert pipeline_records is not None
 
         # "x" is the input data data column — should not appear
         assert "x" not in pipeline_records.column_names
         assert "_input_x" not in pipeline_records.column_names
+
+
+# ---------------------------------------------------------------------------
+# compute_base_entry_id
+# ---------------------------------------------------------------------------
+
+
+class TestComputeBaseEntryId:
+    def test_returns_non_empty_bytes(self):
+        stream = _make_stream([{"id": 0, "x": 10}])
+        node, _ = _make_node(stream)
+        tag = Tag({"id": 0})
+        data = Data({"x": 10})
+        base_entry_id = node.compute_base_entry_id(tag, data)
+        assert isinstance(base_entry_id, bytes)
+        assert len(base_entry_id) > 0
+        assert b":" in base_entry_id
+
+    def test_same_inputs_produce_same_id(self):
+        stream = _make_stream([{"id": 0, "x": 10}])
+        node, _ = _make_node(stream)
+        tag = Tag({"id": 0})
+        data = Data({"x": 10})
+        assert node.compute_base_entry_id(tag, data) == node.compute_base_entry_id(tag, data)
+
+    def test_different_tags_produce_different_ids(self):
+        stream = _make_stream([{"id": 0, "x": 10}])
+        node, _ = _make_node(stream)
+        data = Data({"x": 10})
+        assert node.compute_base_entry_id(Tag({"id": 0}), data) != node.compute_base_entry_id(Tag({"id": 1}), data)
+
+    def test_different_data_produce_different_ids(self):
+        stream = _make_stream([{"id": 0, "x": 10}])
+        node, _ = _make_node(stream)
+        tag = Tag({"id": 0})
+        assert node.compute_base_entry_id(tag, Data({"x": 10})) != node.compute_base_entry_id(tag, Data({"x": 99}))
+
+    def test_differs_from_versioned_entry_id_at_index_zero(self):
+        """After ITL-508, compute_pipeline_entry_id includes the index in the preimage,
+        so compute_pipeline_entry_id(tag, data, 0) != compute_base_entry_id(tag, data)."""
+        stream = _make_stream([{"id": 0, "x": 10}])
+        node, _ = _make_node(stream)
+        tag = Tag({"id": 0})
+        data = Data({"x": 10})
+        base_id = node.compute_base_entry_id(tag, data)
+        versioned_id_0 = node.compute_pipeline_entry_id(tag, data, 0)
+        assert base_id != versioned_id_0
+
+
+# ---------------------------------------------------------------------------
+# compute_pipeline_entry_id with recomputation_index
+# ---------------------------------------------------------------------------
+
+
+class TestVersionedEntryIdDiffersByIndex:
+    def test_different_indices_produce_different_ids(self):
+        stream = _make_stream([{"id": 0, "x": 10}])
+        node, _ = _make_node(stream)
+        tag = Tag({"id": 0})
+        data = Data({"x": 10})
+        assert node.compute_pipeline_entry_id(tag, data, 0) != node.compute_pipeline_entry_id(tag, data, 1)
+
+    def test_same_index_produces_same_id(self):
+        stream = _make_stream([{"id": 0, "x": 10}])
+        node, _ = _make_node(stream)
+        tag = Tag({"id": 0})
+        data = Data({"x": 10})
+        assert node.compute_pipeline_entry_id(tag, data, 1) == node.compute_pipeline_entry_id(tag, data, 1)
+
+    def test_default_index_zero_is_consistent(self):
+        stream = _make_stream([{"id": 0, "x": 10}])
+        node, _ = _make_node(stream)
+        tag = Tag({"id": 0})
+        data = Data({"x": 10})
+        assert node.compute_pipeline_entry_id(tag, data) == node.compute_pipeline_entry_id(tag, data, 0)

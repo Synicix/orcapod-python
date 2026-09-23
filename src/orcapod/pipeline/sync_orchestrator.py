@@ -11,15 +11,17 @@ import uuid
 from typing import TYPE_CHECKING, Any, Literal
 
 from orcapod.pipeline.result import OrchestratorResult
+from orcapod.utils import arrow_utils
 from orcapod.protocols.node_protocols import (
     is_function_node,
     is_operator_node,
+    is_side_effect_function_node,
+    is_side_effect_node,
     is_source_node,
 )
 
 if TYPE_CHECKING:
-    import networkx as nx
-
+    from orcapod.pipeline.dag import GraphProtocol
     from orcapod.protocols.observability_protocols import ExecutionObserverProtocol
     from orcapod.protocols.core_protocols import DataProtocol, TagProtocol
 
@@ -45,7 +47,7 @@ class SyncPipelineOrchestrator:
 
     def run(
         self,
-        graph: nx.DiGraph,
+        graph: GraphProtocol[Any],
         *,
         observer: ExecutionObserverProtocol | None = None,
         materialize_results: bool = True,
@@ -55,7 +57,7 @@ class SyncPipelineOrchestrator:
         """Execute the node graph synchronously.
 
         Args:
-            graph: A NetworkX DiGraph with GraphNode objects as vertices.
+            graph: A ``GraphProtocol`` DAG with GraphNode objects as vertices.
             observer: Optional execution observer forwarded to nodes.
             materialize_results: If True, keep all node outputs in memory
                 and return them. If False, discard buffers after downstream
@@ -70,21 +72,20 @@ class SyncPipelineOrchestrator:
             OrchestratorResult with node outputs.
         """
         from orcapod.pipeline.observer import NoOpObserver
-        import networkx as nx
 
         run_id = run_id or str(uuid.uuid4())
         effective_observer = observer if observer is not None else NoOpObserver()
         effective_observer.on_run_start(run_id, pipeline_uri=pipeline_uri)
 
         try:
-            topo_order = list(nx.topological_sort(graph))
+            topo_order = list(graph.topological_sort())
             buffers: dict[Any, list[tuple[TagProtocol, DataProtocol]]] = {}
             processed: set[Any] = set()
 
             for node in topo_order:
                 if is_source_node(node):
                     buffers[node] = node.execute(observer=effective_observer)
-                elif is_function_node(node):
+                elif is_function_node(node) or is_side_effect_function_node(node):
                     upstream_buf = self._gather_upstream(node, graph, buffers)
                     upstream_node = list(graph.predecessors(node))[0]
                     input_stream = self._materialize_as_stream(upstream_buf, upstream_node)
@@ -92,6 +93,7 @@ class SyncPipelineOrchestrator:
                         input_stream,
                         observer=effective_observer,
                         error_policy=self._error_policy,
+                        run_id=run_id,
                     )
                 elif is_operator_node(node):
                     upstream_buffers = self._gather_upstream_multi(node, graph, buffers)
@@ -100,6 +102,15 @@ class SyncPipelineOrchestrator:
                         for buf, upstream_node in upstream_buffers
                     ]
                     buffers[node] = node.execute(*input_streams, observer=effective_observer)
+                elif is_side_effect_node(node):
+                    upstream_buf = self._gather_upstream(node, graph, buffers)
+                    upstream_node = list(graph.predecessors(node))[0]
+                    input_stream = self._materialize_as_stream(upstream_buf, upstream_node)
+                    buffers[node] = node.execute(
+                        input_stream,
+                        observer=effective_observer,
+                        run_id=run_id,
+                    )
                 else:
                     raise TypeError(
                         f"Unknown node type: {getattr(node, 'node_type', None)!r}"
@@ -119,7 +130,7 @@ class SyncPipelineOrchestrator:
 
     @staticmethod
     def _gather_upstream(
-        node: Any, graph: nx.DiGraph, buffers: dict[Any, list[tuple[Any, Any]]]
+        node: Any, graph: "GraphProtocol[Any]", buffers: dict[Any, list[tuple[Any, Any]]]
     ) -> list[tuple[Any, Any]]:
         """Gather a single upstream buffer (for function nodes)."""
         predecessors = list(graph.predecessors(node))
@@ -131,7 +142,7 @@ class SyncPipelineOrchestrator:
 
     @staticmethod
     def _gather_upstream_multi(
-        node: Any, graph: nx.DiGraph, buffers: dict[Any, list[tuple[Any, Any]]]
+        node: Any, graph: "GraphProtocol[Any]", buffers: dict[Any, list[tuple[Any, Any]]]
     ) -> list[tuple[list[tuple[Any, Any]], Any]]:
         """Gather multiple upstream buffers with their nodes (for operators).
 
@@ -163,22 +174,19 @@ class SyncPipelineOrchestrator:
             An ArrowTableStream.
         """
         from orcapod.core.streams.arrow_table_stream import ArrowTableStream
-        from orcapod.utils import arrow_utils
         from orcapod.utils.lazy_module import LazyModule
 
         pa = LazyModule("pyarrow")
 
         if not buf:
-            # Build an empty stream with the correct schema from the upstream node
+            # Build an empty stream preserving declared field nullability.
             tag_schema, data_schema = upstream_node.output_schema(
                 columns={"system_tags": True, "source": True}
             )
             type_converter = upstream_node.data_context.type_converter
-            empty_fields = {}
-            for name, py_type in {**tag_schema, **data_schema}.items():
-                arrow_type = type_converter.python_type_to_arrow_type(py_type)
-                empty_fields[name] = pa.array([], type=arrow_type)
-            empty_table = pa.table(empty_fields)
+            empty_table = arrow_utils.make_empty_table(
+                {**tag_schema, **data_schema}, type_converter
+            )
             tag_keys = upstream_node.keys()[0]
             return ArrowTableStream(
                 empty_table,
@@ -217,7 +225,7 @@ class SyncPipelineOrchestrator:
     @staticmethod
     def _gc_buffers(
         current_node: Any,
-        graph: nx.DiGraph,
+        graph: "GraphProtocol[Any]",
         buffers: dict[Any, list[tuple[Any, Any]]],
         processed: set[Any],
     ) -> None:

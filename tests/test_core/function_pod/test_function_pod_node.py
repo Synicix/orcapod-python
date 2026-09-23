@@ -20,6 +20,7 @@ import pytest
 from orcapod.core.datagrams import Data, Tag
 from orcapod.core.function_pod import FunctionPod
 from orcapod.core.nodes import FunctionNode
+from orcapod.core.nodes.function_node import FunctionJobNode
 from orcapod.core.data_function import PythonDataFunction
 from orcapod.core.streams import ArrowTableStream
 from orcapod.databases import InMemoryArrowDatabase
@@ -41,7 +42,7 @@ def _make_node(
 ) -> FunctionNode:
     if db is None:
         db = InMemoryArrowDatabase()
-    return FunctionNode(
+    return FunctionJobNode(
         function_pod=FunctionPod(data_function=pf),
         input_stream=make_int_stream(n=n),
         pipeline_database=db,
@@ -72,7 +73,7 @@ def _make_node_with_system_tags(
         schema=schema,
     )
     stream = ArrowTableStream(table, tag_columns=["id"], system_tag_columns=["run"])
-    return FunctionNode(
+    return FunctionJobNode(
         function_pod=FunctionPod(data_function=pf),
         input_stream=stream,
         pipeline_database=db,
@@ -94,7 +95,7 @@ class TestFunctionNodeConstruction:
     def node(self, double_pf) -> FunctionNode:
         db = InMemoryArrowDatabase()
         stream = make_int_stream(n=3)
-        return FunctionNode(
+        return FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=stream,
             pipeline_database=db,
@@ -158,7 +159,7 @@ class TestFunctionNodeConstruction:
             tag_columns=["id"],
         )
         with pytest.raises(ValueError):
-            FunctionNode(
+            FunctionJobNode(
                 function_pod=FunctionPod(data_function=double_pf),
                 input_stream=bad_stream,
                 pipeline_database=db,
@@ -166,7 +167,7 @@ class TestFunctionNodeConstruction:
 
     def test_result_database_defaults_to_pipeline_database(self, double_pf):
         db = InMemoryArrowDatabase()
-        node = FunctionNode(
+        node = FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=make_int_stream(n=2),
             pipeline_database=db,
@@ -176,7 +177,7 @@ class TestFunctionNodeConstruction:
     def test_separate_result_database_accepted(self, double_pf):
         pipeline_db = InMemoryArrowDatabase()
         result_db = InMemoryArrowDatabase()
-        node = FunctionNode(
+        node = FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=make_int_stream(n=2),
             pipeline_database=pipeline_db,
@@ -194,7 +195,7 @@ class TestFunctionNodeOutputSchema:
     @pytest.fixture
     def node(self, double_pf) -> FunctionNode:
         db = InMemoryArrowDatabase()
-        return FunctionNode(
+        return FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=make_int_stream(n=3),
             pipeline_database=db,
@@ -230,7 +231,7 @@ class TestFunctionNodeExecuteData:
     @pytest.fixture
     def node(self, double_pf) -> FunctionNode:
         db = InMemoryArrowDatabase()
-        return FunctionNode(
+        return FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=make_int_stream(n=3),
             pipeline_database=db,
@@ -256,7 +257,7 @@ class TestFunctionNodeExecuteData:
         node.execute_data(tag, data)
         db = node._pipeline_database
         db.flush()
-        all_records = db.get_all_records(node.node_identity_path)
+        all_records = db.get_all_records(node._versioned_pipeline_path)
         assert all_records is not None
         assert all_records.num_rows >= 1
 
@@ -266,20 +267,24 @@ class TestFunctionNodeExecuteData:
         node._process_data_internal(tag, data)
         db = node._pipeline_database
         db.flush()
-        all_records = db.get_all_records(node.node_identity_path)
+        all_records = db.get_all_records(node._versioned_pipeline_path)
         assert all_records is not None
         assert all_records.num_rows >= 1
 
-    def test_execute_data_second_call_same_input_deduplicates(self, node):
+    def test_execute_data_second_call_same_input_appends_recomputation_record(self, node):
+        """Under the ITL-508 recomputation-index design, each call for the same
+        logical input creates a new versioned pipeline record rather than
+        deduplicating. Two calls produce two records with sequential indices.
+        """
         tag = Tag({"id": 0})
         data = Data({"x": 3})
         node._process_data_internal(tag, data)
         node._process_data_internal(tag, data)
         db = node._pipeline_database
         db.flush()
-        all_records = db.get_all_records(node.node_identity_path)
+        all_records = db.get_all_records(node._versioned_pipeline_path)
         assert all_records is not None
-        assert all_records.num_rows == 1
+        assert all_records.num_rows == 2
 
     def test_process_and_store_two_data_add_two_entries(self, node):
         tag = Tag({"id": 0})
@@ -288,7 +293,7 @@ class TestFunctionNodeExecuteData:
         node._process_data_internal(tag, data1)
         node._process_data_internal(tag, data2)
         db = node._pipeline_database
-        all_records = db.get_all_records(node.node_identity_path)
+        all_records = db.get_all_records(node._versioned_pipeline_path)
         assert all_records is not None
         assert all_records.num_rows == 2
 
@@ -302,7 +307,7 @@ class TestFunctionNodeStreamInterface:
     @pytest.fixture
     def node(self, double_pf) -> FunctionNode:
         db = InMemoryArrowDatabase()
-        node = FunctionNode(
+        node = FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=make_int_stream(n=3),
             pipeline_database=db,
@@ -334,12 +339,12 @@ class TestFunctionNodeStreamInterface:
 class TestFunctionNodePipelineIdentity:
     def test_pipeline_hash_same_schema_same_hash(self, double_pf):
         db = InMemoryArrowDatabase()
-        node1 = FunctionNode(
+        node1 = FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=make_int_stream(n=3),
             pipeline_database=db,
         )
-        node2 = FunctionNode(
+        node2 = FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=make_int_stream(n=5),  # different data, same schema
             pipeline_database=db,
@@ -362,12 +367,12 @@ class TestFunctionNodePipelineIdentity:
             ),
             tag_columns=["id"],
         )
-        node_a = FunctionNode(
+        node_a = FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=stream_a,
             pipeline_database=db,
         )
-        node_b = FunctionNode(
+        node_b = FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=stream_b,
             pipeline_database=db,
@@ -386,12 +391,12 @@ class TestFunctionNodePipelineIdentity:
         Two nodes with same schema share the same full path; per-run isolation
         is achieved via the _node_content_hash row column."""
         db = InMemoryArrowDatabase()
-        node1 = FunctionNode(
+        node1 = FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=make_int_stream(n=3),
             pipeline_database=db,
         )
-        node2 = FunctionNode(
+        node2 = FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=make_int_stream(n=99),  # different data
             pipeline_database=db,
@@ -494,17 +499,18 @@ class TestGetAllRecordsMetaColumns:
         assert "id" in result.column_names
         assert "result" in result.column_names
 
-    def test_input_data_hash_values_are_non_empty_strings(self, filled_node):
+    def test_input_data_hash_values_are_non_empty_bytes(self, filled_node):
+        """v1 schema: INPUT_DATA_HASH_COL stores binary (to_prefixed_digest())."""
         result = filled_node.get_all_records(columns={"meta": True})
         assert result is not None
         hashes = result.column(constants.INPUT_DATA_HASH_COL).to_pylist()
-        assert all(isinstance(h, str) and len(h) > 0 for h in hashes)
+        assert all(isinstance(h, bytes) and len(h) > 0 for h in hashes)
 
-    def test_data_record_id_values_are_non_empty_strings(self, filled_node):
+    def test_data_record_id_values_are_non_empty_bytes(self, filled_node):
         result = filled_node.get_all_records(columns={"meta": True})
         assert result is not None
         ids = result.column(constants.DATA_RECORD_ID).to_pylist()
-        assert all(isinstance(rid, str) and len(rid) > 0 for rid in ids)
+        assert all(isinstance(rid, bytes) and len(rid) == 16 for rid in ids)
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +650,19 @@ class TestGetAllRecordsAllInfo:
             full_result.column("result").to_pylist()
         )
 
+    def test_all_info_excludes_pipeline_entry_id(self, filled_node):
+        """__pipeline_entry_id must not appear in get_all_records output even with all_info."""
+        result = filled_node.get_all_records(all_info=True)
+        assert result is not None
+        assert "__pipeline_entry_id" not in result.column_names
+
+    def test_all_info_excludes_node_content_hash(self, filled_node):
+        """NODE_CONTENT_HASH_COL must not appear in get_all_records output even with all_info."""
+        from orcapod.system_constants import constants
+        result = filled_node.get_all_records(all_info=True)
+        assert result is not None
+        assert constants.NODE_CONTENT_HASH_COL not in result.column_names
+
 
 # ---------------------------------------------------------------------------
 # 12. node_identity_path structure
@@ -653,7 +672,7 @@ class TestGetAllRecordsAllInfo:
 class TestFunctionNodeIdentityPath:
     def test_node_identity_path_starts_with_pf_uri(self, double_pf):
         db = InMemoryArrowDatabase()
-        node = FunctionNode(
+        node = FunctionJobNode(
             function_pod=FunctionPod(data_function=double_pf),
             input_stream=make_int_stream(n=2),
             pipeline_database=db,
@@ -676,7 +695,7 @@ class TestFunctionNodeResultPath:
         since the database is pre-scoped at compile time (ENG-340/ENG-349)."""
         db = InMemoryArrowDatabase()
         pod = FunctionPod(data_function=double_pf)
-        node = FunctionNode(
+        node = FunctionJobNode(
             function_pod=pod,
             input_stream=make_int_stream(n=2),
             pipeline_database=db,
@@ -686,5 +705,7 @@ class TestFunctionNodeResultPath:
         node.execute_data(tag, data)
         db.flush()
 
+        # record_path now includes the schema version suffix (v1 schema)
+        from orcapod.system_constants import RESULT_DB_SCHEMA_VERSION
         result_path = node._cached_function_pod.record_path
-        assert result_path == pod.uri
+        assert result_path == pod.uri + (RESULT_DB_SCHEMA_VERSION,)

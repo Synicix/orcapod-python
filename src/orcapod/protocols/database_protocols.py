@@ -14,7 +14,7 @@ class ArrowDatabaseProtocol(Protocol):
     def add_record(
         self,
         record_path: tuple[str, ...],
-        record_id: str,
+        record_id: bytes,
         record: pa.Table,
         skip_duplicates: bool = False,
         flush: bool = False,
@@ -32,7 +32,7 @@ class ArrowDatabaseProtocol(Protocol):
     def get_record_by_id(
         self,
         record_path: tuple[str, ...],
-        record_id: str,
+        record_id: bytes,
         record_id_column: str | None = None,
         flush: bool = False,
     ) -> pa.Table | None: ...
@@ -48,7 +48,7 @@ class ArrowDatabaseProtocol(Protocol):
     def get_records_by_ids(
         self,
         record_path: tuple[str, ...],
-        record_ids: Collection[str],
+        record_ids: Collection[bytes],
         record_id_column: str | None = None,
         flush: bool = False,
     ) -> pa.Table | None: ...
@@ -97,6 +97,22 @@ class ArrowDatabaseProtocol(Protocol):
         Returns:
             A new database instance with
             base_path == self.base_path + path_components.
+        """
+        ...
+
+    def table_exists(self, record_path: tuple[str, ...]) -> bool:
+        """Return ``True`` if a table exists at ``record_path``, ``False`` otherwise.
+
+        This is a cheap existence check that does NOT load any records.
+        Used by schema detection logic to determine whether a versioned table
+        path already exists before checking for legacy paths.
+
+        Args:
+            record_path: Path components identifying the table, relative to
+                ``self.base_path``.
+
+        Returns:
+            ``True`` if a table exists at the given path, ``False`` otherwise.
         """
         ...
 

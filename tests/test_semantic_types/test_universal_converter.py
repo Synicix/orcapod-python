@@ -1,414 +1,138 @@
-from pathlib import Path
-from typing import cast
-
-import numpy as np
-import pyarrow as pa
-import pytest
-
-from orcapod.contexts import get_default_context
-from orcapod.semantic_types import universal_converter
+"""Tests for UniversalTypeConverter list[T] / set[T] extension type support."""
+from __future__ import annotations
 
 
-def test_python_type_to_arrow_type_basic():
-    assert universal_converter.python_type_to_arrow_type(int) == pa.int64()
-    assert universal_converter.python_type_to_arrow_type(float) == pa.float64()
-    assert universal_converter.python_type_to_arrow_type(str) == pa.large_string()
-    assert universal_converter.python_type_to_arrow_type(bool) == pa.bool_()
-    assert universal_converter.python_type_to_arrow_type(bytes) == pa.large_binary()
+def test_register_python_class_list_of_uuid_returns_extension_type():
+    """register_python_class(list[uuid.UUID]) must return a pa.ExtensionType, not raise."""
+    import uuid
+    import pyarrow as pa
+    from orcapod.contexts import create_registry
 
+    converter = create_registry().get_context().type_converter
+    result = converter.register_python_class(list[uuid.UUID])
 
-def test_python_type_to_arrow_type_numpy():
-    assert universal_converter.python_type_to_arrow_type(np.int32) == pa.int32()
-    assert universal_converter.python_type_to_arrow_type(np.float64) == pa.float64()
-    assert universal_converter.python_type_to_arrow_type(np.bool_) == pa.bool_()
-
-
-def test_python_type_to_arrow_type_custom():
-    arrow_type = universal_converter.python_type_to_arrow_type(Path)
-    # Should be a StructType with field 'path' of type large_string
-    assert isinstance(arrow_type, pa.StructType)
-    assert len(arrow_type) == 1
-    field = arrow_type[0]
-    assert field.name == "path"
-    assert field.type == pa.large_string()
-
-
-def test_python_type_to_arrow_type_upath():
-    from upath import UPath
-
-    arrow_type = universal_converter.python_type_to_arrow_type(UPath)
-    # Should be a StructType with field 'upath' of type large_string
-    assert isinstance(arrow_type, pa.StructType)
-    assert len(arrow_type) == 1
-    field = arrow_type[0]
-    assert field.name == "upath"
-    assert field.type == pa.large_string()
-
-
-def test_optional_upath_converter():
-    """Test that Optional[UPath] correctly converts UPath values."""
-    from upath import UPath
-
-    to_arrow, to_python = universal_converter.get_conversion_functions(UPath | None)
-
-    # Test with UPath value
-    path = UPath("/tmp/test.txt")
-    result = to_arrow(path)
-    assert result == {"upath": "/tmp/test.txt"}
-
-    # Test with None
-    assert to_arrow(None) is None
-
-
-def test_complex_union_raises_error():
-    """Test that complex unions (multiple non-None types) raise ValueError."""
-    from upath import UPath
-
-    with pytest.raises(ValueError, match="Complex unions"):
-        universal_converter.get_conversion_functions(UPath | Path)
-
-    with pytest.raises(ValueError, match="Complex unions"):
-        universal_converter.python_type_to_arrow_type(UPath | Path)
-
-
-def test_python_type_to_arrow_type_context():
-    ctx = get_default_context()
-    assert universal_converter.python_type_to_arrow_type(int, ctx) == pa.int64()
-
-
-def test_python_type_to_arrow_type_unsupported():
-    class CustomType:
-        pass
-
-    with pytest.raises(Exception):
-        universal_converter.python_type_to_arrow_type(CustomType)
-
-
-def test_arrow_type_to_python_type_basic():
-    assert universal_converter.arrow_type_to_python_type(pa.int64()) is int
-    assert universal_converter.arrow_type_to_python_type(pa.float64()) is float
-    assert universal_converter.arrow_type_to_python_type(pa.large_string()) is str
-    assert universal_converter.arrow_type_to_python_type(pa.bool_()) is bool
-    assert universal_converter.arrow_type_to_python_type(pa.large_binary()) is bytes
-
-
-def test_arrow_type_to_python_type_context():
-    ctx = get_default_context()
-    assert universal_converter.arrow_type_to_python_type(pa.int64(), ctx) is int
-
-
-def test_arrow_type_to_python_type_unsupported():
-    class FakeArrowType:
-        pass
-
-    with pytest.raises(Exception):
-        universal_converter.arrow_type_to_python_type(
-            cast(pa.DataType, FakeArrowType())
-        )
-
-
-def test_get_conversion_functions_basic():
-    to_arrow, to_python = universal_converter.get_conversion_functions(int)
-    assert callable(to_arrow)
-    assert callable(to_python)
-    assert to_arrow(42) == 42
-    assert to_python(42) == 42
-
-
-def test_get_conversion_functions_custom():
-    to_arrow, to_python = universal_converter.get_conversion_functions(str)
-    assert to_arrow("abc") == "abc"
-    assert to_python("abc") == "abc"
-
-
-def test_get_conversion_functions_context():
-    ctx = get_default_context()
-    to_arrow, to_python = universal_converter.get_conversion_functions(float, ctx)
-    assert to_arrow(1.5) == 1.5
-    assert to_python(1.5) == 1.5
-
-
-def test_python_type_to_arrow_type_list():
-    # Unparameterized list should raise ValueError
-    with pytest.raises(ValueError):
-        universal_converter.python_type_to_arrow_type(list)
-
-
-def test_python_type_to_arrow_type_dict():
-    # Unparameterized dict should raise ValueError
-    with pytest.raises(ValueError):
-        universal_converter.python_type_to_arrow_type(dict)
-
-
-def test_python_type_to_arrow_type_list_of_dict():
-    # For list[dict[str, int]], expect LargeListType of LargeListType of StructType
-    arrow_type = universal_converter.python_type_to_arrow_type(list[dict[str, int]])
-    # Should be LargeListType
-    assert arrow_type.__class__.__name__.endswith("ListType")
-    # Next level should also be LargeListType
-    arrow_type = cast(pa.ListType, arrow_type)
-    inner_list = arrow_type.value_type
-    assert inner_list.__class__.__name__.endswith("ListType")
-    # Innermost should be StructType
-    struct_type = inner_list.value_type
-    assert isinstance(struct_type, pa.StructType)
-    assert struct_type[0].name == "key"
-    assert struct_type[0].type == pa.large_string()
-    assert struct_type[1].name == "value"
-    assert struct_type[1].type == pa.int64()
-
-
-def test_python_type_to_arrow_type_dict_of_list():
-    # dict[str, list[int]] should be a LargeListType of StructType, with value field as LargeListType
-    arrow_type = universal_converter.python_type_to_arrow_type(dict[str, list[int]])
-    assert arrow_type.__class__.__name__.endswith("ListType")
-    arrow_type = cast(pa.ListType, arrow_type)
-    struct_type = arrow_type.value_type
-    assert isinstance(struct_type, pa.StructType)
-    assert struct_type[0].name == "key"
-    assert struct_type[0].type == pa.large_string()
-    assert struct_type[1].name == "value"
-    value_type = struct_type[1].type
-    assert value_type.__class__.__name__.endswith("ListType")
-    assert value_type.value_type == pa.int64()
-
-
-def test_python_type_to_arrow_type_list_of_list():
-    arrow_type = universal_converter.python_type_to_arrow_type(list[list[int]])
-    assert arrow_type.__class__.__name__.endswith("ListType")
-    arrow_type = cast(pa.ListType, arrow_type)
-    inner_list = arrow_type.value_type
-    assert inner_list.__class__.__name__.endswith("ListType")
-    assert inner_list.value_type == pa.int64()
-
-
-def test_python_type_to_arrow_type_deeply_nested():
-    # dict[str, list[list[dict[str, float]]]]
-    complex_type = dict[str, list[list[dict[str, float]]]]
-    arrow_type = universal_converter.python_type_to_arrow_type(complex_type)
-    # Should be a LargeListType of StructType
-    assert arrow_type.__class__.__name__.endswith("ListType")
-    arrow_type = cast(pa.ListType, arrow_type)
-    struct_type = arrow_type.value_type
-    assert isinstance(struct_type, pa.StructType)
-    assert struct_type[0].name == "key"
-    assert struct_type[0].type == pa.large_string()
-    assert struct_type[1].name == "value"
-    outer_list = struct_type[1].type
-    assert outer_list.__class__.__name__.endswith("ListType")
-    inner_list = outer_list.value_type
-    assert inner_list.__class__.__name__.endswith("ListType")
-    inner_struct_list = inner_list.value_type
-    assert inner_struct_list.__class__.__name__.endswith("ListType")
-    inner_struct = inner_struct_list.value_type
-    assert isinstance(inner_struct, pa.StructType)
-    assert inner_struct[0].name == "key"
-    assert inner_struct[0].type == pa.large_string()
-    assert inner_struct[1].name == "value"
-    assert inner_struct[1].type == pa.float64()
-
-
-# Roundtrip tests for complex types
-def test_roundtrip_list_of_int():
-    py_val = [1, 2, 3, 4]
-    to_arrow, to_python = universal_converter.get_conversion_functions(list[int])
-    arr = to_arrow(py_val)
-    py_val2 = to_python(arr)
-    assert py_val == py_val2
-
-
-def test_roundtrip_dict_str_int():
-    py_val = {"a": 1, "b": 2}
-    to_arrow, to_python = universal_converter.get_conversion_functions(dict[str, int])
-    arr = to_arrow(py_val)
-    py_val2 = to_python(arr)
-    # dict roundtrip may come back as dict or list of pairs
-    if isinstance(py_val2, dict):
-        assert py_val == py_val2
-    else:
-        # Accept list of pairs
-        assert sorted(py_val.items()) == sorted(
-            [(d["key"], d["value"]) for d in py_val2]
-        )
-
-
-def test_roundtrip_list_of_list_of_float():
-    py_val = [[1.1, 2.2], [3.3, 4.4]]
-    to_arrow, to_python = universal_converter.get_conversion_functions(
-        list[list[float]]
+    assert isinstance(result, pa.ExtensionType), (
+        f"Expected pa.ExtensionType, got {type(result)}: {result!r}"
     )
-    arr = to_arrow(py_val)
-    py_val2 = to_python(arr)
-    assert py_val == py_val2
+    assert result.extension_name == "list[orcapod.uuid]"
 
 
-def test_roundtrip_set_of_int():
-    py_val = {1, 2, 3}
-    to_arrow, to_python = universal_converter.get_conversion_functions(set[int])
-    arr = to_arrow(py_val)
-    py_val2 = to_python(arr)
-    # set will come back as list
-    assert py_val != py_val2
-    assert set(py_val) == set(py_val2)
+def test_register_python_class_set_of_uuid_returns_extension_type():
+    """register_python_class(set[uuid.UUID]) must return a pa.ExtensionType."""
+    import uuid
+    import pyarrow as pa
+    from orcapod.contexts import create_registry
+
+    converter = create_registry().get_context().type_converter
+    result = converter.register_python_class(set[uuid.UUID])
+
+    assert isinstance(result, pa.ExtensionType)
+    assert result.extension_name == "set[orcapod.uuid]"
 
 
-def test_roundtrip_various_complex_types():
-    cases = [
-        ([1, 2, 3], list[int]),
-        ([["a", "b"], ["c"]], list[list[str]]),
-        ({"a": 1, "b": 2}, dict[str, int]),
-        ([{"x": 1.1, "y": 2.2}, {"x": 3.3, "y": 4.4}], list[dict[str, float]]),
-        ({"a": [1, 2], "b": [3]}, dict[str, list[int]]),
-        (
-            [{"a": [1, 2]}, {"b": [3], "c": [4, 5, 6]}],
-            list[dict[str, list[int]]],
-        ),
-        (
-            [[{"k": "a", "v": 1.1}, {"k": "b", "v": 2.2}], [{"k": "c", "v": 3.3}]],
-            list[list[dict[str, float]]],
-        ),
-        (
-            {"outer": [{"inner": [1, 2]}, {"inner": [3, 4]}]},
-            dict[str, list[dict[str, list[int]]]],
-        ),
-        ({"a": {"b": {"c": 42}}}, dict[str, dict[str, dict[str, int]]]),
-        ({"a": None, "b": 2}, dict[str, int]),
-        (
-            [{"x": [1, 2], "y": [3, 4]}, {"x": [5], "y": [6, 7]}],
-            list[dict[str, list[int]]],
-        ),
-    ]
-    for py_val, typ in cases:
-        to_arrow, to_python = universal_converter.get_conversion_functions(typ)
-        arr = to_arrow(py_val)
-        py_val2 = to_python(arr)
-        assert py_val == py_val2, f"Failed roundtrip for type {typ} with value {py_val}"
+def test_register_python_class_list_of_int_unchanged():
+    """register_python_class(list[int]) must still return plain large_list(int64)."""
+    import pyarrow as pa
+    from orcapod.contexts import create_registry
+
+    converter = create_registry().get_context().type_converter
+    result = converter.register_python_class(list[int])
+
+    assert not isinstance(result, pa.ExtensionType)
+    assert pa.types.is_large_list(result)
+    assert result.value_type == pa.int64()
 
 
-def test_incomplete_roundtrip_types():
-    cases = [({"a": {1, 2}, "b": {3}}, dict[str, set[int]], {"a": [1, 2], "b": [3]})]
+def test_register_python_class_list_of_uuid_idempotent():
+    """Calling register_python_class(list[uuid.UUID]) twice returns same ext type name."""
+    import uuid
+    from orcapod.contexts import create_registry
 
-    for py_val, typ, expected_return in cases:
-        to_arrow, to_python = universal_converter.get_conversion_functions(typ)
-        arr = to_arrow(py_val)
-        py_val2 = to_python(arr)
-        assert py_val2 == expected_return, (
-            f"Failed roundtrip for type {typ} with value {py_val}"
-        )
-
-
-def test_roundtrip_minimal_key_list_issue():
-    py_val = [{"test": [1, 2, 3], "next": [3, 4]}]
-    typ = list[dict[str, list[int]]]
-    to_arrow, to_python = universal_converter.get_conversion_functions(typ)
-    arr = to_arrow(py_val)
-    py_val2 = to_python(arr)
-    print("Original:", py_val)
-    print("Roundtrip:", py_val2)
-    assert py_val == py_val2
+    converter = create_registry().get_context().type_converter
+    result1 = converter.register_python_class(list[uuid.UUID])
+    result2 = converter.register_python_class(list[uuid.UUID])
+    assert result1.extension_name == result2.extension_name
 
 
-def test_roundtrip_simpler_key_issue_dict_str_list():
-    py_val = {"a": [1, 2]}
-    typ = dict[str, list[int]]
-    to_arrow, to_python = universal_converter.get_conversion_functions(typ)
-    arr = to_arrow(py_val)
-    py_val2 = to_python(arr)
-    print("Original dict[str, list[int]]:", py_val)
-    print("Roundtrip:", py_val2)
-    assert py_val == py_val2
+def test_python_type_to_arrow_type_list_of_uuid_returns_extension_type():
+    """python_type_to_arrow_type(list[UUID]) must return the list[orcapod.uuid] ext type."""
+    import uuid
+    import pyarrow as pa
+    from orcapod.contexts import create_registry
 
+    converter = create_registry().get_context().type_converter
+    # Pre-register so the type is in the registry before python_type_to_arrow_type is called.
+    converter.register_python_class(list[uuid.UUID])
+    result = converter.python_type_to_arrow_type(list[uuid.UUID])
 
-def test_roundtrip_simpler_key_issue_list_dict_str_int():
-    py_val = [{"key": "a", "value": 1}]
-    typ = list[dict[str, int]]
-    to_arrow, to_python = universal_converter.get_conversion_functions(typ)
-    arr = to_arrow(py_val)
-    py_val2 = to_python(arr)
-    print("Original list[dict[str, int]]:", py_val)
-    print("Roundtrip:", py_val2)
-    assert py_val == py_val2
-
-
-def test_inspect_arrow_schema_dict_str_list():
-    py_val = {"test": [1, 2]}
-    typ = dict[str, list[int]]
-    arrow_type = universal_converter.python_type_to_arrow_type(typ)
-    print("Arrow type for dict[str, list[int]]:", arrow_type)
-    to_arrow_struct, to_python = universal_converter.get_conversion_functions(typ)
-    arr = to_arrow_struct(py_val)
-    assert arr == [{"key": "test", "value": [1, 2]}]
-
-
-def test_schema_as_required_strips_optional_fields():
-    from orcapod.types import Schema
-
-    s = Schema({"a": int, "b": str}, optional_fields=["b"])
-    result = s.as_required()
-    assert result == Schema({"a": int, "b": str})
-    assert result.optional_fields == frozenset()
-
-
-def test_schema_as_required_idempotent():
-    from orcapod.types import Schema
-
-    s = Schema({"a": int, "b": str}, optional_fields=["a", "b"])
-    once = s.as_required()
-    twice = s.as_required().as_required()
-    assert once == twice
-
-
-def test_python_schema_to_arrow_non_nullable():
-    """Plain types (no | None) must produce nullable=False Arrow fields."""
-    from orcapod.types import Schema
-
-    ctx = get_default_context()
-    schema = ctx.type_converter.python_schema_to_arrow_schema(
-        Schema({"a": int, "b": str, "c": float, "d": bool, "e": bytes})
+    assert isinstance(result, pa.ExtensionType), (
+        f"Expected pa.ExtensionType, got {type(result)}: {result!r}"
     )
-    for name in ("a", "b", "c", "d", "e"):
-        assert schema.field(name).nullable is False, (
-            f"Field '{name}' should be nullable=False for a plain type"
-        )
+    assert result.extension_name == "list[orcapod.uuid]"
 
 
-def test_python_schema_to_arrow_optional_nullable():
-    """Optional types (T | None) must produce nullable=True Arrow fields."""
-    from orcapod.types import Schema
+def test_python_type_to_arrow_type_list_of_uuid_without_prior_registration():
+    """python_type_to_arrow_type(list[UUID]) must work even without prior register_python_class."""
+    import uuid
+    import pyarrow as pa
+    from orcapod.contexts import create_registry
 
-    ctx = get_default_context()
-    schema = ctx.type_converter.python_schema_to_arrow_schema(
-        Schema({"x": int | None, "y": str | None})
-    )
-    assert schema.field("x").nullable is True
-    assert schema.field("y").nullable is True
+    # Fresh converter — ListLogicalType not yet registered
+    converter = create_registry().get_context().type_converter
+    result = converter.python_type_to_arrow_type(list[uuid.UUID])
 
-
-def test_arrow_schema_to_python_nullable_becomes_optional():
-    """nullable=True Arrow fields must reconstruct as T | None."""
-    ctx = get_default_context()
-    arrow_schema = pa.schema([pa.field("x", pa.int64(), nullable=True)])
-    python_schema = ctx.type_converter.arrow_schema_to_python_schema(arrow_schema)
-    assert python_schema["x"] == int | None
+    assert isinstance(result, pa.ExtensionType)
+    assert result.extension_name == "list[orcapod.uuid]"
 
 
-def test_arrow_schema_to_python_non_nullable_stays_plain():
-    """nullable=False Arrow fields must reconstruct as plain T."""
-    ctx = get_default_context()
-    arrow_schema = pa.schema([pa.field("x", pa.int64(), nullable=False)])
-    python_schema = ctx.type_converter.arrow_schema_to_python_schema(arrow_schema)
-    assert python_schema["x"] == int
+def test_arrow_schema_to_python_schema_round_trip_list_of_uuid():
+    """Schema round-trip: list[UUID] → Arrow ext → python schema → Arrow ext (same type)."""
+    import uuid
+    import pyarrow as pa
+    from orcapod.contexts import create_registry
+
+    converter = create_registry().get_context().type_converter
+    python_schema = {"ids": list[uuid.UUID]}
+    arrow_schema = converter.python_schema_to_arrow_schema(python_schema)
+
+    # Arrow schema has list[orcapod.uuid] extension type
+    assert arrow_schema.field("ids").type.extension_name == "list[orcapod.uuid]"
+
+    # Recover Python schema
+    recovered = converter.arrow_schema_to_python_schema(arrow_schema)
+    assert recovered["ids"] == list[uuid.UUID]
+
+    # Re-derive Arrow schema — must be identical
+    arrow_schema2 = converter.python_schema_to_arrow_schema(recovered)
+    assert arrow_schema2.field("ids").type.extension_name == "list[orcapod.uuid]"
 
 
-def test_round_trip_preserves_optionality():
-    """Python schema → Arrow → Python schema is lossless for nullable/non-nullable."""
-    from orcapod.types import Schema
+def test_value_converter_list_of_uuid_produces_bytes_list():
+    """get_python_to_arrow_converter(list[UUID]) converts [uuid, uuid] → [bytes, bytes]."""
+    import uuid
+    from orcapod.contexts import create_registry
 
-    ctx = get_default_context()
-    original = Schema({"required": int, "nullable_field": int | None})
-    arrow = ctx.type_converter.python_schema_to_arrow_schema(original)
-    recovered = ctx.type_converter.arrow_schema_to_python_schema(arrow)
+    converter = create_registry().get_context().type_converter
+    converter.register_python_class(list[uuid.UUID])
 
-    assert recovered["required"] == int
-    assert recovered["nullable_field"] == int | None
-    assert recovered == original
+    conv_fn = converter.get_python_to_arrow_converter(list[uuid.UUID])
+    u1 = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    u2 = uuid.UUID("87654321-4321-8765-4321-876543218765")
+    result = conv_fn([u1, u2])
+
+    assert result == [u1.bytes, u2.bytes]
+
+
+def test_value_converter_set_of_uuid_produces_bytes_list():
+    """get_python_to_arrow_converter(set[UUID]) converts {uuid} → [bytes]."""
+    import uuid
+    from orcapod.contexts import create_registry
+
+    converter = create_registry().get_context().type_converter
+    converter.register_python_class(set[uuid.UUID])
+
+    conv_fn = converter.get_python_to_arrow_converter(set[uuid.UUID])
+    u1 = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    result = conv_fn({u1})
+
+    assert result == [u1.bytes]

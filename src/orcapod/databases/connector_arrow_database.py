@@ -12,7 +12,7 @@ Example::
 
     connector = SQLiteConnector(":memory:")   # PLT-1076
     db = ConnectorArrowDatabase(connector)
-    db.add_record(("results", "my_fn"), record_id="abc", record=table)
+    db.add_record(("results", "my_fn"), record_id=b"sha256:abc", record=table)
     db.flush()
 """
 from __future__ import annotations
@@ -22,6 +22,7 @@ from collections import defaultdict
 from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
+from orcapod.databases.utils import coerce_record_id
 from orcapod.protocols.db_connector_protocol import ColumnInfo, DBConnectorProtocol
 from orcapod.utils.lazy_module import LazyModule
 
@@ -64,7 +65,7 @@ class ConnectorArrowDatabase:
         max_hierarchy_depth: int = 10,
         _path_prefix: tuple[str, ...] = (),
         _shared_pending_batches: dict[str, pa.Table] | None = None,
-        _shared_pending_record_ids: dict[str, set[str]] | None = None,
+        _shared_pending_record_ids: dict[str, set[bytes]] | None = None,
         _shared_pending_skip_existing: dict[str, bool] | None = None,
         _root: ConnectorArrowDatabase | None = None,
         _scoped_path: tuple[str, ...] = (),
@@ -75,7 +76,7 @@ class ConnectorArrowDatabase:
         self._root = _root
         self._scoped_path = _scoped_path
         self._pending_batches: dict[str, pa.Table] = _shared_pending_batches if _shared_pending_batches is not None else {}
-        self._pending_record_ids: dict[str, set[str]] = _shared_pending_record_ids if _shared_pending_record_ids is not None else defaultdict(set)
+        self._pending_record_ids: dict[str, set[bytes]] = _shared_pending_record_ids if _shared_pending_record_ids is not None else defaultdict(set)
         # Per-batch flag: True when the batch was added with skip_duplicates=True,
         # so flush() can pass skip_existing=True to the connector and let it use
         # native INSERT-OR-IGNORE semantics rather than Python-side prefiltering.
@@ -125,11 +126,12 @@ class ConnectorArrowDatabase:
     # ── Record-ID column helpers ──────────────────────────────────────────────
 
     def _ensure_record_id_column(
-        self, arrow_data: pa.Table, record_id: str
+        self, arrow_data: pa.Table, record_id: str | bytes
     ) -> pa.Table:
+        record_id = coerce_record_id(record_id)
         if self.RECORD_ID_COLUMN not in arrow_data.column_names:
             key_array = pa.array(
-                [record_id] * len(arrow_data), type=pa.large_string()
+                [record_id] * len(arrow_data), type=pa.large_binary()
             )
             arrow_data = arrow_data.add_column(0, self.RECORD_ID_COLUMN, key_array)
         return arrow_data
@@ -185,12 +187,31 @@ class ConnectorArrowDatabase:
             return None
         return pa.Table.from_batches(batches)
 
+    def table_exists(self, record_path: tuple[str, ...]) -> bool:
+        """Return ``True`` if a table exists at ``record_path``.
+
+        Checks both the in-memory pending batch and the connector's committed
+        tables. This is a cheap existence check that does NOT load any records.
+
+        Args:
+            record_path: Path components identifying the table, relative to
+                ``self.base_path``.
+
+        Returns:
+            ``True`` if a table exists at the given path, ``False`` otherwise.
+        """
+        table_name = self._path_to_table_name(self._path_prefix + record_path)
+        record_key = self._get_record_key(record_path)
+        if record_key in self._pending_batches:
+            return True
+        return table_name in self._connector.get_table_names()
+
     # ── Write methods ─────────────────────────────────────────────────────────
 
     def add_record(
         self,
         record_path: tuple[str, ...],
-        record_id: str,
+        record_id: str | bytes,
         record: pa.Table,
         skip_duplicates: bool = False,
         flush: bool = False,
@@ -233,9 +254,20 @@ class ConnectorArrowDatabase:
                 [rename_map.get(c, c) for c in records.column_names]
             )
 
+        # Enforce binary record-id type — string columns are rejected to prevent
+        # silent deduplication failures (set[str] & set[bytes] is always empty).
+        rid_type = records[self.RECORD_ID_COLUMN].type
+        if not pa.types.is_large_binary(rid_type) and not pa.types.is_binary(rid_type):
+            raise TypeError(
+                f"Record-id column must be pa.large_binary() or pa.binary(), "
+                f"got {rid_type}. Encode the column to bytes before calling add_records()."
+            )
+
+        self._connector.validate_records(records)
+
         records = self._deduplicate_within_table(records)
         record_key = self._get_record_key(record_path)
-        input_ids = set(cast(list[str], records[self.RECORD_ID_COLUMN].to_pylist()))
+        input_ids = set(cast(list[bytes], records[self.RECORD_ID_COLUMN].to_pylist()))
 
         if skip_duplicates:
             # Only filter records that conflict with the in-flight pending batch.
@@ -272,7 +304,7 @@ class ConnectorArrowDatabase:
                 [existing_pending, records]
             )
         self._pending_record_ids[record_key].update(
-            cast(list[str], records[self.RECORD_ID_COLUMN].to_pylist())
+            cast(list[bytes], records[self.RECORD_ID_COLUMN].to_pylist())
         )
 
         if flush:
@@ -343,10 +375,14 @@ class ConnectorArrowDatabase:
                 }
                 pending_cols = {c.name: c.arrow_type for c in columns}
                 if existing_cols != pending_cols:
+                    def _fmt(cols: dict) -> str:
+                        return "{" + ", ".join(
+                            f"{k}: {v}" for k, v in sorted(cols.items())
+                        ) + "}"
                     raise ValueError(
                         f"Schema mismatch for table {table_name!r}: "
-                        f"existing columns {sorted(existing_cols)} differ from "
-                        f"pending columns {sorted(pending_cols)}. "
+                        f"existing={_fmt(existing_cols)}, "
+                        f"pending={_fmt(pending_cols)}. "
                         "Schema evolution is not supported."
                     )
 
@@ -365,12 +401,13 @@ class ConnectorArrowDatabase:
     def get_record_by_id(
         self,
         record_path: tuple[str, ...],
-        record_id: str,
+        record_id: str | bytes,
         record_id_column: str | None = None,
         flush: bool = False,
     ) -> pa.Table | None:
         if flush:
             self.flush()
+        record_id = coerce_record_id(record_id)
         record_key = self._get_record_key(record_path)
 
         # Check pending first
@@ -412,13 +449,13 @@ class ConnectorArrowDatabase:
     def get_records_by_ids(
         self,
         record_path: tuple[str, ...],
-        record_ids: Collection[str],
+        record_ids: Collection[str | bytes],
         record_id_column: str | None = None,
         flush: bool = False,
     ) -> pa.Table | None:
         if flush:
             self.flush()
-        ids_list = list(record_ids)
+        ids_list = [coerce_record_id(r) for r in record_ids]
         if not ids_list:
             return None
         all_records = self.get_all_records(

@@ -1,20 +1,19 @@
 """
 orcapod.hashing.semantic_hashing
 =================================
-Sub-package containing all components of the semantic hashing system:
+  SemanticAwarePythonHasher           -- content-based recursive object hasher
+  PythonTypeHandlerRegistry    -- MRO-aware registry mapping types → PythonTypeHandlerProtocol
+  BuiltinPythonTypeHandlerRegistry  -- pre-populated registry with built-in hashers
+  ContentIdentifiableMixin            -- convenience mixin for content-identifiable objects
 
-  BaseSemanticHasher          -- content-based recursive object hasher
-  TypeHandlerRegistry         -- MRO-aware registry mapping types → TypeHandlerProtocol
-  BuiltinTypeHandlerRegistry  -- pre-populated registry with built-in handlers
-  ContentIdentifiableMixin    -- convenience mixin for content-identifiable objects
-
-Built-in TypeHandlerProtocol implementations:
-  PathContentHandler          -- pathlib.Path  → file-content hash
-  UUIDHandler                 -- uuid.UUID     → canonical string
-  BytesHandler                -- bytes/bytearray → hex string
-  FunctionHandler             -- callable      → via FunctionInfoExtractorProtocol
-  TypeObjectHandler           -- type objects  → "type:<module>.<qualname>"
-  register_builtin_handlers   -- populate a registry with all of the above
+Built-in PythonTypeHandlerProtocol implementations:
+  UUIDHandler          -- uuid.UUID     → canonical bytes
+  BytesHandler         -- bytes/bytearray → hex string
+  FunctionHandler      -- callable      → via FunctionInfoExtractorProtocol
+  TypeObjectHandler    -- type objects  → "type:<module>.<qualname>"
+  FileHandler          -- orcapod.File  → file content hash
+  DirectoryHandler     -- orcapod.Directory → recursive Merkle tree hash
+  register_builtin_python_type_handlers -- populate a registry with all of the above
 
 Function info extractors (used by FunctionHandler):
   FunctionNameExtractor
@@ -24,11 +23,12 @@ Function info extractors (used by FunctionHandler):
 
 from orcapod.hashing.semantic_hashing.builtin_handlers import (
     BytesHandler,
+    DirectoryHandler,
+    FileHandler,
     FunctionHandler,
-    PathContentHandler,
     TypeObjectHandler,
     UUIDHandler,
-    register_builtin_handlers,
+    register_builtin_python_type_handlers,
 )
 from orcapod.hashing.semantic_hashing.content_identifiable_mixin import (
     ContentIdentifiableMixin,
@@ -38,28 +38,24 @@ from orcapod.hashing.semantic_hashing.function_info_extractors import (
     FunctionNameExtractor,
     FunctionSignatureExtractor,
 )
-from orcapod.hashing.semantic_hashing.semantic_hasher import BaseSemanticHasher
+from orcapod.hashing.semantic_hashing.semantic_hasher import SemanticAwarePythonHasher
 from orcapod.hashing.semantic_hashing.type_handler_registry import (
-    BuiltinTypeHandlerRegistry,
-    TypeHandlerRegistry,
+    BuiltinPythonTypeHandlerRegistry,
+    PythonTypeHandlerRegistry,
 )
 
 __all__ = [
-    # Core hasher
-    "BaseSemanticHasher",
-    # Registry
-    "TypeHandlerRegistry",
-    "BuiltinTypeHandlerRegistry",
-    # Mixin
+    "SemanticAwarePythonHasher",
+    "PythonTypeHandlerRegistry",
+    "BuiltinPythonTypeHandlerRegistry",
     "ContentIdentifiableMixin",
-    # Built-in handlers
-    "PathContentHandler",
     "UUIDHandler",
     "BytesHandler",
     "FunctionHandler",
     "TypeObjectHandler",
-    "register_builtin_handlers",
-    # Function info extractors
+    "FileHandler",
+    "DirectoryHandler",
+    "register_builtin_python_type_handlers",
     "FunctionNameExtractor",
     "FunctionSignatureExtractor",
     "FunctionInfoExtractorFactory",

@@ -1,16 +1,94 @@
 import hashlib
 import inspect
 import logging
+import types as _types
+import typing
 import zlib
 from collections.abc import Callable, Collection
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import xxhash
 from upath import UPath
 
 from orcapod.types import ContentHash, PathLike
 
+if TYPE_CHECKING:
+    from orcapod.protocols.semantic_types_protocols import TypeConverterProtocol
+
 logger = logging.getLogger(__name__)
+
+
+def is_union_annotation(annotation: object) -> bool:
+    """Return ``True`` if *annotation* is a union type.
+
+    Detects both PEP 604 ``X | Y`` (``types.UnionType``) and
+    ``typing.Union[X, Y]`` / ``typing.Optional[X]``.
+
+    Args:
+        annotation: Any Python object (type annotation or otherwise).
+
+    Returns:
+        ``True`` if the annotation is a union; ``False`` otherwise.
+    """
+    if isinstance(annotation, _types.UnionType):
+        return True
+    return getattr(annotation, "__origin__", None) is typing.Union
+
+
+def canonical_annotation_str(
+    annotation: object,
+    type_converter: "TypeConverterProtocol | None" = None,
+) -> str:
+    """Return a stable, canonical string for a type annotation.
+
+    Resolves types registered in *type_converter* (e.g. ``orcapod.File``) to
+    their stable ``logical_type_name`` (e.g. ``"orcapod.file"``) via
+    ``type_converter.get_logical_type()``, so that internal module relocations
+    do not change the string representation.
+
+    For union types (both PEP 604 ``X | Y`` and ``typing.Union[X, Y]``),
+    members are sorted byte-wise so that ``str | Path`` and ``Path | str``
+    produce the same canonical string.
+
+    For generic aliases (``list[X]``, ``dict[K, V]``), args are recursed with
+    the same converter so nested orcapod types are also canonicalized.
+
+    Non-union, non-generic types not found in the converter fall through to
+    ``inspect.formatannotation``, preserving existing behaviour exactly.
+
+    Args:
+        annotation: A type annotation object.
+        type_converter: Optional ``TypeConverterProtocol``. When provided,
+            registered logical types resolve to their stable
+            ``logical_type_name`` via ``get_logical_type()``.
+
+    Returns:
+        A canonical string representation.
+    """
+    # Registered logical type: use stable canonical name (e.g. "orcapod.file")
+    if type_converter is not None and isinstance(annotation, type):
+        lt = type_converter.get_logical_type(annotation)
+        if lt is not None:
+            return lt.logical_type_name
+
+    # Union types (PEP 604 X | Y and typing.Union): sort members for order-independence
+    if is_union_annotation(annotation):
+        args = getattr(annotation, "__args__", ()) or ()
+        member_strs = sorted(canonical_annotation_str(a, type_converter) for a in args)
+        return " | ".join(member_strs)
+
+    # Generic aliases (list[X], dict[K, V], etc.): recurse over args
+    origin = getattr(annotation, "__origin__", None)
+    if origin is not None and not is_union_annotation(annotation):
+        args = getattr(annotation, "__args__", None) or ()
+        origin_str = canonical_annotation_str(origin, type_converter)
+        if args:
+            args_str = ", ".join(canonical_annotation_str(a, type_converter) for a in args)
+            return f"{origin_str}[{args_str}]"
+        return origin_str
+
+    return inspect.formatannotation(annotation)
 
 
 def combine_hashes(
@@ -159,7 +237,16 @@ def get_function_signature(
     Returns:
         A string representation of the function signature.
     """
-    sig = inspect.signature(func)
+    # Use eval_str=True so that string annotations produced by
+    # ``from __future__ import annotations`` (PEP 563) are resolved to live
+    # type objects before we check for union types.
+    try:
+        sig = inspect.signature(func, eval_str=True)
+    except (NameError, TypeError, AttributeError, SyntaxError):
+        # Fall back to unresolved signatures when annotation evaluation fails
+        # (e.g. forward references that cannot be resolved in the function's
+        # module scope).
+        sig = inspect.signature(func)
     parts: dict[str, object] = {}
 
     if include_module and hasattr(func, "__module__"):
@@ -170,6 +257,13 @@ def get_function_signature(
     param_strs = []
     for name, param in sig.parameters.items():
         param_str = str(param)
+        annotation = param.annotation
+        if annotation is not inspect.Parameter.empty and is_union_annotation(annotation):
+            old_ann = inspect.formatannotation(annotation)
+            new_ann = canonical_annotation_str(annotation)
+            # Replace ": <old_ann>" with ": <new_ann>" (first occurrence only).
+            # The ": " prefix distinguishes the annotation from the default value.
+            param_str = param_str.replace(f": {old_ann}", f": {new_ann}", 1)
         if not include_defaults and "=" in param_str:
             param_str = param_str.split("=")[0].strip()
         param_strs.append(param_str)
@@ -184,7 +278,11 @@ def get_function_signature(
         f"{parts['name']}{parts['params']}"
     )
     if "returns" in parts:
-        fn_string += f"-> {parts['returns']}"
+        ret = parts["returns"]
+        if is_union_annotation(ret):
+            fn_string += f"-> {canonical_annotation_str(ret)}"
+        else:
+            fn_string += f"-> {ret}"
     return fn_string
 
 

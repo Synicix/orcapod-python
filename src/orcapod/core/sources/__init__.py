@@ -8,12 +8,12 @@ from .delta_table_source import DeltaTableSource
 from .derived_source import DerivedSource
 from .dict_source import DictSource
 from .list_source import ListSource
+from .polling_source import PollingSource
 from .source_registry import GLOBAL_SOURCE_REGISTRY, SourceRegistry
 from .source_proxy import SourceProxy
 from .spiraldb_table_source import SpiralDBTableSource
 from .sqlite_table_source import SQLiteTableSource
 from .postgresql_table_source import PostgreSQLTableSource
-
 __all__ = [
     "RootSource",
     "ArrowTableSource",
@@ -25,8 +25,9 @@ __all__ = [
     "DerivedSource",
     "DictSource",
     "ListSource",
-    "SourceRegistry",
+    "PollingSource",
     "SourceProxy",
+    "SourceRegistry",
     "SpiralDBTableSource",
     "SQLiteTableSource",
     "PostgreSQLTableSource",

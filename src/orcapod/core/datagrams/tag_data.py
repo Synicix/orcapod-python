@@ -8,15 +8,16 @@ Tag and Data — datagram subclasses with system-tags and source-info support.
     requested via ``ColumnConfig(system_tags=True)``.
 
 ``Data``
-    Extends ``Datagram`` with *source information*: provenance tokens (strings or None)
-    keyed by data-column name.  Source-info keys are stored without the
-    ``constants.SOURCE_PREFIX`` internally and added back when serialising via
-    ``as_dict()`` / ``as_table()``.
+    Extends ``Datagram`` with *source information*: provenance tokens (strings,
+    None, or lists of tokens) keyed by data-column name.  Source-info keys are
+    stored without the ``constants.SOURCE_PREFIX`` internally and added back when
+    serialising via ``as_dict()`` / ``as_table()``.
 """
 
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Self
 
@@ -24,7 +25,15 @@ from orcapod import contexts
 from orcapod.core.datagrams.datagram import Datagram
 from orcapod.semantic_types import infer_python_schema_from_pylist_data
 from orcapod.system_constants import constants
-from orcapod.types import ColumnConfig, DataValue, Schema, SchemaLike
+from orcapod.types import (
+    ColumnConfig,
+    ContentHash,
+    DataType,
+    DataValue,
+    Schema,
+    SchemaLike,
+    SourceInfoValue,
+)
 from orcapod.utils import arrow_utils
 from orcapod.utils.lazy_module import LazyModule
 
@@ -61,7 +70,7 @@ class Tag(Datagram):
         meta_info: "Mapping[str, DataValue] | None" = None,
         python_schema: "SchemaLike | None" = None,
         data_context: "str | contexts.DataContext | None" = None,
-        record_id: "str | None" = None,
+        record_uuid: "uuid.UUID | None" = None,
         **kwargs,
     ) -> None:
         import pyarrow as _pa
@@ -78,7 +87,7 @@ class Tag(Datagram):
                 data,
                 meta_info=meta_info,
                 data_context=data_context,
-                record_id=record_id,
+                record_uuid=record_uuid,
                 **kwargs,
             )
             sys_tag_cols = [
@@ -114,7 +123,7 @@ class Tag(Datagram):
                 python_schema=python_schema,
                 meta_info=meta_info,
                 data_context=data_context,
-                record_id=record_id,
+                record_uuid=record_uuid,
                 **kwargs,
             )
 
@@ -236,11 +245,60 @@ class Tag(Datagram):
 # ---------------------------------------------------------------------------
 
 
+# TODO(NPIPE-204): these two helpers only understand scalars and ``list[T]``.
+# Structured source-info values (a struct/dataclass token, or a mapping) will need
+# their own branches, and the recursion should dispatch on a logical type rather
+# than on ``isinstance(value, list)``. Deriving the type from the first element is
+# also a shortcut: it is correct for the homogeneous lists many->one operators
+# produce, but not in general. Raised in review on PR #250.
+def _source_info_arrow_type(value: "SourceInfoValue") -> "pa.DataType":
+    """Derive the Arrow type for a single source-info value.
+
+    Scalars and unknowns map to ``large_string``; lists map to ``large_list``
+    of their element type, recursively.  An empty list defaults to
+    ``large_list(large_string)``.
+
+    Args:
+        value: The stored provenance token.
+
+    Returns:
+        The Arrow type to declare for this value.
+    """
+    import pyarrow as _pa
+
+    if isinstance(value, list):
+        if not value:
+            return _pa.large_list(_pa.large_string())
+        return _pa.large_list(_source_info_arrow_type(value[0]))
+    return _pa.large_string()
+
+
+def _source_info_python_type(value: "SourceInfoValue") -> DataType:
+    """Derive the Python type for a single source-info value.
+
+    Mirrors ``_source_info_arrow_type`` for the ``Schema`` representation, and
+    shares its list-only limitation -- see the TODO above that function.
+
+    Args:
+        value: The stored provenance token.
+
+    Returns:
+        ``str`` for scalars and unknowns, ``list[...]`` for lists.
+    """
+    if isinstance(value, list):
+        if not value:
+            return list[str]
+        return list[_source_info_python_type(value[0])]  # type: ignore[misc]
+    return str
+
+
 class Data(Datagram):
     """
     Datagram with source-information tracking.
 
-    Source info maps each data-column name to a provenance token (``str | None``).
+    Source info maps each data-column name to a provenance token
+    (``SourceInfoValue``: a string, ``None``, or -- for many->one operators -- a
+    list of tokens, one per aggregated member).
     Keys in ``_source_info`` are stored **without** the ``SOURCE_PREFIX``; the
     prefix is added transparently when serialising to dict or Arrow table.
 
@@ -253,10 +311,10 @@ class Data(Datagram):
         self,
         data: "Mapping[str, DataValue] | pa.Table | pa.RecordBatch",
         meta_info: "Mapping[str, DataValue] | None" = None,
-        source_info: "Mapping[str, str | None] | None" = None,
+        source_info: "Mapping[str, SourceInfoValue] | None" = None,
         python_schema: "SchemaLike | None" = None,
         data_context: "str | contexts.DataContext | None" = None,
-        record_id: "str | None" = None,
+        record_uuid: "uuid.UUID | None" = None,
         **kwargs,
     ) -> None:
         import pyarrow as _pa
@@ -287,12 +345,12 @@ class Data(Datagram):
                 data_table,
                 meta_info=meta_info,
                 data_context=data_context,
-                record_id=record_id,
+                record_uuid=record_uuid,
                 **kwargs,
             )
             si_table = prefixed_tables[constants.SOURCE_PREFIX]
             if si_table.num_columns > 0 and si_table.num_rows > 0:
-                self._source_info: dict[str, str | None] = {
+                self._source_info: dict[str, SourceInfoValue] = {
                     k.removeprefix(constants.SOURCE_PREFIX): v
                     for k, v in si_table.to_pylist()[0].items()
                 }
@@ -305,7 +363,7 @@ class Data(Datagram):
                 for k, v in data.items()
                 if not k.startswith(constants.SOURCE_PREFIX)
             }
-            contained_source_info: dict[str, str | None] = {
+            contained_source_info: dict[str, SourceInfoValue] = {
                 k.removeprefix(constants.SOURCE_PREFIX): v  # type: ignore[misc]
                 for k, v in data.items()
                 if k.startswith(constants.SOURCE_PREFIX)
@@ -315,7 +373,7 @@ class Data(Datagram):
                 python_schema=python_schema,
                 meta_info=meta_info,
                 data_context=data_context,
-                record_id=record_id,
+                record_uuid=record_uuid,
                 **kwargs,
             )
             self._source_info = {**contained_source_info, **(source_info or {})}
@@ -336,7 +394,10 @@ class Data(Datagram):
                     for k, v in self._source_info.items()
                 }
                 schema = _pa.schema(
-                    [_pa.field(k, _pa.large_string()) for k in prefixed]
+                    [
+                        _pa.field(k, _source_info_arrow_type(v))
+                        for k, v in prefixed.items()
+                    ]
                 )
                 self._source_info_table = _pa.Table.from_pylist(
                     [prefixed], schema=schema
@@ -349,11 +410,11 @@ class Data(Datagram):
     # Source-info API
     # ------------------------------------------------------------------
 
-    def source_info(self) -> "dict[str, str | None]":
+    def source_info(self) -> "dict[str, SourceInfoValue]":
         """Return source info for all data-column keys (None for unknown)."""
         return {k: self._source_info.get(k) for k in self.keys()}
 
-    def with_source_info(self, **source_info: "str | None") -> Self:
+    def with_source_info(self, **source_info: "SourceInfoValue") -> Self:
         """Create a copy with updated source-information entries."""
         current = dict(self._source_info)
         for key, value in source_info.items():
@@ -390,7 +451,9 @@ class Data(Datagram):
         column_config = ColumnConfig.handle_config(columns, all_info=all_info)
         if column_config.source:
             for key in super().keys():
-                schema[f"{constants.SOURCE_PREFIX}{key}"] = str
+                schema[f"{constants.SOURCE_PREFIX}{key}"] = _source_info_python_type(
+                    self._source_info.get(key)
+                )
         return Schema(schema)
 
     def arrow_schema(
@@ -472,3 +535,189 @@ class Data(Datagram):
         new_p._source_info = dict(self._source_info)
         new_p._source_info_table = self._source_info_table if include_cache else None
         return new_p
+
+
+# ---------------------------------------------------------------------------
+# EmptyData
+# ---------------------------------------------------------------------------
+
+
+class EmptyData(Data):
+    """A ``Data``-shaped token representing missing data.
+
+    ``EmptyData`` is produced when an upstream pod's ephemeral result has
+    expired or been pruned. It carries all normal datagram metadata (data
+    context, record UUID) but has no data payload. Every payload-access
+    method raises ``EmptyDataAccessError`` — callers must
+    ``isinstance(data, EmptyData)`` before touching columns.
+
+    ``content_hash()`` is overridden to return ``cached_content_hash`` (the
+    hash of the **upstream output** — i.e., the data payload this token stands
+    in for). Because the downstream node's result cache is keyed by its own
+    input (= the upstream output), returning this hash lets
+    ``ResultCache.lookup(empty_data)`` work transparently without any changes
+    to the cache infrastructure. If ``cached_content_hash`` is ``None`` (a
+    pipeline DB row lacking the stored hash column), ``content_hash()`` raises
+    ``EmptyDataHashMissingError`` loudly.
+
+    ``empty_source_info`` is an optional provenance field for the future
+    tag-row reconstruction follow-up. This release defines the field; the write
+    logic is deferred.
+
+    Args:
+        cached_content_hash: The content hash of the missing data payload this
+            token represents — typically the upstream node's output hash, which
+            equals the downstream node's input hash. ``None`` for old-format
+            rows lacking the stored hash column.
+        empty_source_info: Optional provenance dict for tag-row reconstruction
+            (follow-up). Keys match tag-row source columns; ``record_id`` may
+            be ``None``.
+        python_schema: Optional schema hint (passed to parent).
+        data_context: Data context key or instance (passed to parent).
+        record_uuid: Optional explicit UUID for this token.
+    """
+
+    def __init__(
+        self,
+        cached_content_hash: ContentHash | None = None,
+        empty_source_info: dict[str, str | None] | None = None,
+        python_schema: SchemaLike | None = None,
+        data_context: str | contexts.DataContext | None = None,
+        record_uuid: uuid.UUID | None = None,
+    ) -> None:
+        # Initialise the parent with an empty dict — no payload columns.
+        super().__init__(
+            {},
+            python_schema=python_schema,
+            data_context=data_context,
+            record_uuid=record_uuid,
+        )
+        self._cached_content_hash: ContentHash | None = cached_content_hash
+        self._empty_source_info: dict[str, str | None] | None = empty_source_info
+
+    # ------------------------------------------------------------------
+    # Content identity
+    # ------------------------------------------------------------------
+
+    def content_hash(self, hasher: Any = None) -> ContentHash:
+        """Return the cached content hash or raise ``EmptyDataHashMissingError``.
+
+        The returned hash is the hash of the **missing payload** this token
+        stands in for — typically the upstream node's output hash (stored as
+        ``OUTPUT_DATA_HASH_COL`` in the pipeline DB). This equals the
+        downstream node's input hash, so ``ResultCache.lookup(empty_data)``
+        finds the correct cached result transparently without touching the
+        missing data.
+
+        Args:
+            hasher: Ignored — ``EmptyData`` uses the stored hash directly.
+
+        Returns:
+            The ``cached_content_hash`` set at construction.
+
+        Raises:
+            EmptyDataHashMissingError: If ``cached_content_hash`` is ``None``.
+        """
+        from orcapod.errors import EmptyDataHashMissingError
+
+        if self._cached_content_hash is None:
+            raise EmptyDataHashMissingError(self)
+        return self._cached_content_hash
+
+    def identity_structure(self) -> Any:
+        """Always raises ``EmptyDataAccessError`` — no payload to hash."""
+        from orcapod.errors import EmptyDataAccessError
+
+        raise EmptyDataAccessError(self, "identity_structure")
+
+    # ------------------------------------------------------------------
+    # Payload-access overrides — all raise EmptyDataAccessError
+    # ------------------------------------------------------------------
+
+    def as_dict(
+        self,
+        *,
+        columns: ColumnConfig | dict[str, Any] | None = None,
+        all_info: bool = False,
+    ) -> dict[str, DataValue]:
+        from orcapod.errors import EmptyDataAccessError
+
+        raise EmptyDataAccessError(self, "as_dict")
+
+    def as_table(
+        self,
+        *,
+        columns: ColumnConfig | dict[str, Any] | None = None,
+        all_info: bool = False,
+    ) -> pa.Table:
+        from orcapod.errors import EmptyDataAccessError
+
+        raise EmptyDataAccessError(self, "as_table")
+
+    def keys(
+        self,
+        *,
+        columns: ColumnConfig | dict[str, Any] | None = None,
+        all_info: bool = False,
+    ) -> tuple[str, ...]:
+        from orcapod.errors import EmptyDataAccessError
+
+        raise EmptyDataAccessError(self, "keys")
+
+    def schema(
+        self,
+        *,
+        columns: ColumnConfig | dict[str, Any] | None = None,
+        all_info: bool = False,
+    ) -> Schema:
+        from orcapod.errors import EmptyDataAccessError
+
+        raise EmptyDataAccessError(self, "schema")
+
+    def arrow_schema(
+        self,
+        *,
+        columns: ColumnConfig | dict[str, Any] | None = None,
+        all_info: bool = False,
+    ) -> pa.Schema:
+        from orcapod.errors import EmptyDataAccessError
+
+        raise EmptyDataAccessError(self, "arrow_schema")
+
+    # ------------------------------------------------------------------
+    # Copy — preserves EmptyData-specific fields
+    # ------------------------------------------------------------------
+
+    def copy(self, include_cache: bool = True, preserve_id: bool = True) -> Self:
+        """Return a shallow copy of this token, preserving EmptyData-specific fields.
+
+        Overrides ``Datagram.copy()`` so that ``_cached_content_hash`` and
+        ``_empty_source_info`` are carried across (the base implementation uses
+        ``object.__new__`` and only copies ``Datagram`` fields, which would
+        silently drop our extra attributes).
+
+        Args:
+            include_cache: Forwarded to ``super().copy()``.
+            preserve_id: Forwarded to ``super().copy()``.
+
+        Returns:
+            A new ``EmptyData`` instance with all fields copied.
+        """
+        new_p = super().copy(include_cache=include_cache, preserve_id=preserve_id)
+        new_p._cached_content_hash = self._cached_content_hash
+        new_p._empty_source_info = self._empty_source_info
+        return new_p
+
+    # ------------------------------------------------------------------
+    # Read-only accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def cached_content_hash(self) -> ContentHash | None:
+        """The stored content hash, or ``None`` if absent (old-format row)."""
+        return self._cached_content_hash
+
+    @property
+    def empty_source_info(self) -> dict[str, str | None] | None:
+        """Optional provenance dict for future tag-row reconstruction."""
+        return self._empty_source_info

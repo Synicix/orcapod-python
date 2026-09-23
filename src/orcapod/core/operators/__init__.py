@@ -6,9 +6,12 @@ from .column_selection import (
     SelectTagColumns,
 )
 from .filters import PolarsFilter
+from .group_by import GroupBy
+from .index import Index
 from .join import Join
 from .mappers import MapData, MapTags
 from .merge_join import MergeJoin
+from .pick import Pick
 from .semijoin import SemiJoin
 
 __all__ = [
@@ -18,9 +21,12 @@ __all__ = [
     "MapTags",
     "MapData",
     "Batch",
+    "GroupBy",
     "SelectTagColumns",
     "SelectDataColumns",
     "DropTagColumns",
     "DropDataColumns",
     "PolarsFilter",
+    "Pick",
+    "Index",
 ]

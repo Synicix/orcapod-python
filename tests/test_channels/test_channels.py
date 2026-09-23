@@ -543,55 +543,57 @@ class TestEdgeCases:
 
 
 class TestConfigTypes:
-    def test_executor_type_enum(self):
-        from orcapod.types import ExecutorType
+    def test_orchestrator_type_enum(self):
+        from orcapod.types import OrchestratorType
 
-        assert ExecutorType.SYNCHRONOUS.value == "synchronous"
-        assert ExecutorType.ASYNC_CHANNELS.value == "async_channels"
+        assert OrchestratorType.SYNCHRONOUS.value == "synchronous"
+        assert OrchestratorType.ASYNC_CHANNELS.value == "async_channels"
 
     def test_pipeline_config_defaults(self):
-        from orcapod.types import ExecutorType, PipelineConfig
+        from orcapod.types import OrchestratorType, PipelineConfig
 
         cfg = PipelineConfig()
-        assert cfg.executor == ExecutorType.SYNCHRONOUS
+        assert cfg.orchestrator == OrchestratorType.SYNCHRONOUS
         assert cfg.channel_buffer_size == 64
         assert cfg.default_max_concurrency is None
 
     def test_pipeline_config_custom(self):
-        from orcapod.types import ExecutorType, PipelineConfig
+        from orcapod.types import OrchestratorType, PipelineConfig
 
         cfg = PipelineConfig(
-            executor=ExecutorType.ASYNC_CHANNELS,
+            orchestrator=OrchestratorType.ASYNC_CHANNELS,
             channel_buffer_size=128,
             default_max_concurrency=4,
         )
-        assert cfg.executor == ExecutorType.ASYNC_CHANNELS
+        assert cfg.orchestrator == OrchestratorType.ASYNC_CHANNELS
         assert cfg.channel_buffer_size == 128
         assert cfg.default_max_concurrency == 4
 
     def test_node_config_defaults(self):
-        from orcapod.types import NodeConfig
+        from orcapod.types import NodeConfig, PodConfig
 
         cfg = NodeConfig()
-        assert cfg.max_concurrency is None
+        assert cfg.is_result_ephemeral is None
+        pod_cfg = PodConfig()
+        assert pod_cfg.max_concurrency is None
 
     def test_resolve_concurrency_node_overrides_pipeline(self):
-        from orcapod.types import NodeConfig, PipelineConfig, resolve_concurrency
+        from orcapod.types import PipelineConfig, PodConfig, resolve_concurrency
 
-        node = NodeConfig(max_concurrency=2)
+        node = PodConfig(max_concurrency=2)
         pipeline = PipelineConfig(default_max_concurrency=8)
         assert resolve_concurrency(node, pipeline) == 2
 
     def test_resolve_concurrency_falls_back_to_pipeline(self):
-        from orcapod.types import NodeConfig, PipelineConfig, resolve_concurrency
+        from orcapod.types import PipelineConfig, PodConfig, resolve_concurrency
 
-        node = NodeConfig()
+        node = PodConfig()
         pipeline = PipelineConfig(default_max_concurrency=8)
         assert resolve_concurrency(node, pipeline) == 8
 
     def test_resolve_concurrency_both_none(self):
-        from orcapod.types import NodeConfig, PipelineConfig, resolve_concurrency
+        from orcapod.types import PipelineConfig, PodConfig, resolve_concurrency
 
-        node = NodeConfig()
+        node = PodConfig()
         pipeline = PipelineConfig()
         assert resolve_concurrency(node, pipeline) is None

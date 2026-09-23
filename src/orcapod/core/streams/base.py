@@ -148,6 +148,27 @@ class StreamBase(TraceableBase):
             self, label=label
         )
 
+    def group_by(
+        self,
+        by: Collection[str],
+        label: str | None = None,
+    ) -> StreamBase:
+        """Reduce rows sharing a tag tuple into one packet per group.
+
+        Group-key columns stay scalar tags; every other column becomes
+        list-valued.  See ``orcapod.core.operators.GroupBy``.
+
+        Args:
+            by: Tag column names to group on.
+            label: Optional node label for the pipeline graph.
+
+        Returns:
+            A stream with one row per distinct group-key tuple.
+        """
+        from orcapod.core.operators import GroupBy
+
+        return GroupBy(by=by)(self, label=label)
+
     def polars_filter(
         self,
         *predicates: Any,
@@ -213,6 +234,65 @@ class StreamBase(TraceableBase):
 
         return DropDataColumns(data_columns, strict=strict)(self, label=label)
 
+    def pick(
+        self,
+        column: str,
+        key: str,
+        out: str | None = None,
+        fail_on_miss: bool = False,
+        label: str | None = None,
+    ) -> StreamBase:
+        """Extract a value from a struct- or dict-typed data column by key.
+
+        For ``dict[K, V]`` columns the lookup is per-packet; if the key is absent
+        the packet is skipped (or an error is raised when ``fail_on_miss=True``).
+
+        Args:
+            column: Name of the data column to project into.
+            key: Dict key or struct field name to extract.
+            out: Output column name. ``None`` (default) replaces ``column``
+                in-place; a string adds a new column alongside the original.
+            fail_on_miss: If ``True``, raise ``RuntimeError`` when the key is
+                absent in a packet instead of skipping.
+            label: Optional label for the operator node.
+
+        Returns:
+            A new stream with the projected column.
+        """
+        from orcapod.core.operators import Pick
+
+        return Pick(column, key, out=out, fail_on_miss=fail_on_miss)(self, label=label)
+
+    def index(
+        self,
+        column: str,
+        i: int,
+        out: str | None = None,
+        fail_on_miss: bool = False,
+        label: str | None = None,
+    ) -> StreamBase:
+        """Extract an element from a list-typed data column by position.
+
+        Out-of-bounds access causes the packet to be skipped (or an error
+        when ``fail_on_miss=True``). Negative indices follow Python semantics
+        (``-1`` is the last element).
+
+        Args:
+            column: Name of the data column to project into.
+            i: Position to extract. Negative indices follow Python semantics.
+            out: Output column name. ``None`` (default) replaces ``column``
+                in-place; a string adds a new column alongside the original.
+            fail_on_miss: If ``True``, raise ``RuntimeError`` on out-of-bounds
+                instead of skipping.
+            label: Optional label for the operator node.
+
+        Returns:
+            A new stream with the projected column.
+        """
+        from orcapod.core.operators import Index
+
+        return Index(column, i, out=out, fail_on_miss=fail_on_miss)(self, label=label)
+
     @abstractmethod
     def keys(
         self,
@@ -244,13 +324,12 @@ class StreamBase(TraceableBase):
     ) -> AsyncIterator[tuple[TagProtocol, DataProtocol]]:
         """Async iterator over (tag, data) pairs.
 
-        Subclasses should override this to provide true async iteration.
+        Default implementation wraps ``iter_data`` as an async generator.
+        Subclasses override this to provide true async streaming behaviour
+        (e.g. ``PollingSource``).
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement async_iter_data"
-        )
-        # Make this an async generator so the return type is correct
-        yield  # pragma: no cover
+        for item in self.iter_data():
+            yield item
 
     @abstractmethod
     def as_table(
@@ -328,7 +407,7 @@ class StreamBase(TraceableBase):
         """Materialize the stream into a concrete collection of
         ``(TagProtocol, DataProtocol)`` pairs.
 
-        This is implemented by iterating over :meth:`iter_data`. Depending on
+        This is implemented by iterating over ``iter_data``. Depending on
         the concrete stream implementation, iterating may trigger computation or
         upstream work, or it may simply materialize already-computed results.
         """

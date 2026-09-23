@@ -2,7 +2,7 @@
 
 Exercises the full status tracking pipeline: observer hooks →
 StatusObserver → database, using InMemoryArrowDatabase and real
-Pipeline objects.
+PipelineJob objects.
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ from orcapod.databases import InMemoryArrowDatabase
 from orcapod.pipeline.serialization import DatabaseRegistry
 from orcapod.pipeline import (
     AsyncPipelineOrchestrator,
-    Pipeline,
     SyncPipelineOrchestrator,
 )
+from orcapod.pipeline.job import PipelineJob
 from orcapod.pipeline.status_observer import StatusObserver
 
 
@@ -35,16 +35,6 @@ def _make_source(n: int = 3) -> ArrowTableSource:
         "x": pa.array([10 * (i + 1) for i in range(n)], type=pa.int64()),
     })
     return ArrowTableSource(table, tag_columns=["id"], infer_nullable=True)
-
-
-def _get_function_node(pipeline: Pipeline):
-    """Return the first function node from the pipeline graph."""
-    import networkx as nx
-
-    for node in nx.topological_sort(pipeline._node_graph):
-        if node.node_type == "function":
-            return node
-    raise RuntimeError("No function node found")
 
 
 # ---------------------------------------------------------------------------
@@ -63,13 +53,12 @@ class TestSyncPipelineSuccessStatus:
         pf = PythonDataFunction(double, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_status", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_status", store=db)
+        with job:
             pod(source, label="doubler")
 
         obs = StatusObserver(status_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         status = obs.get_status()
 
@@ -98,13 +87,12 @@ class TestFailingDatasStatus:
         pf = PythonDataFunction(failing, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_fail_status", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_fail_status", store=db)
+        with job:
             pod(source, label="failing")
 
         obs = StatusObserver(status_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         status = obs.get_status()
 
@@ -142,13 +130,12 @@ class TestFlatStatusStorage:
         pf = PythonDataFunction(identity, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_flat_status", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_flat_status", store=db)
+        with job:
             pod(source, label="ident")
 
         obs = StatusObserver(status_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         # All status is now aggregated via get_status()
         all_status = obs.get_status()
@@ -172,13 +159,12 @@ class TestQueryableTagColumns:
         pf = PythonDataFunction(identity, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_tags_status", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_tags_status", store=db)
+        with job:
             pod(source, label="ident")
 
         obs = StatusObserver(status_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         status = obs.get_status()
 
@@ -205,13 +191,12 @@ class TestAsyncOrchestratorStatus:
         pf = PythonDataFunction(double, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_async_status", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_async_status", store=db)
+        with job:
             pod(source, label="doubler")
 
         obs = StatusObserver(status_database=db)
-        orch = AsyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(orchestrator=AsyncPipelineOrchestrator(), observer=obs)
 
         status = obs.get_status()
 
@@ -239,15 +224,15 @@ class TestFailFastErrorPolicy:
         pf = PythonDataFunction(failing, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_failfast_status", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_failfast_status", store=db)
+        with job:
             pod(source, label="failing")
 
         obs = StatusObserver(status_database=db)
         orch = SyncPipelineOrchestrator(error_policy="fail_fast")
 
         with pytest.raises(RuntimeError, match="crash"):
-            pipeline.run(orchestrator=orch, observer=obs)
+            job.run(orchestrator=orch, observer=obs)
 
         status = obs.get_status()
 
@@ -282,13 +267,12 @@ class TestMixedSuccessFailure:
         pf = PythonDataFunction(safe_div, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_mixed_status", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_mixed_status", store=db)
+        with job:
             pod(source, label="divider")
 
         obs = StatusObserver(status_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         status = obs.get_status()
 
@@ -323,14 +307,13 @@ class TestMultipleFunctionNodesSeparateStatus:
         pf2 = PythonDataFunction(triple, output_keys="final", executor=LocalPythonFunctionExecutor())
         pod2 = FunctionPod(pf2)
 
-        pipeline = Pipeline(name="test_multi_status", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_multi_status", store=db)
+        with job:
             s1 = pod1(source, label="doubler")
             pod2(s1, label="tripler")
 
         obs = StatusObserver(status_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         # Combined status contains events for both nodes
         status = obs.get_status()
@@ -340,12 +323,13 @@ class TestMultipleFunctionNodesSeparateStatus:
 
 
 # ---------------------------------------------------------------------------
-# 9. get_status() returns combined status across all node sub-paths
+# 9. get_status() aggregates across all node sub-paths
 # ---------------------------------------------------------------------------
 
 
 class TestGetStatusNodeSpecific:
     def test_get_status_returns_rows_for_both_nodes(self):
+        """get_status() should return aggregated rows covering every node."""
         db = InMemoryArrowDatabase()
         source = _make_source(2)
 
@@ -360,18 +344,18 @@ class TestGetStatusNodeSpecific:
         pf2 = PythonDataFunction(triple, output_keys="final", executor=LocalPythonFunctionExecutor())
         pod2 = FunctionPod(pf2)
 
-        pipeline = Pipeline(name="test_filter_status", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_filter_status", store=db)
+        with job:
             s1 = pod1(source, label="doubler")
             pod2(s1, label="tripler")
 
         obs = StatusObserver(status_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
+        # get_status() aggregates across all node sub-paths:
+        # 2 data × 2 nodes × 2 events = 8 rows total
         all_status = obs.get_status()
         assert all_status is not None
-        # Each node: 2 data × 2 events = 4 rows per node → 8 total
         assert all_status.num_rows == 8
 
 
@@ -391,13 +375,12 @@ class TestStatusSchema:
         pf = PythonDataFunction(identity, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_schema", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_schema", store=db)
+        with job:
             pod(source, label="ident")
 
         obs = StatusObserver(status_database=db)
-        orch = SyncPipelineOrchestrator()
-        pipeline.run(orchestrator=orch, observer=obs)
+        job.run(observer=obs)
 
         status = obs.get_status()
 
@@ -433,19 +416,22 @@ class TestRunIdTracking:
         pf = PythonDataFunction(identity, output_keys="result", executor=LocalPythonFunctionExecutor())
         pod = FunctionPod(pf)
 
-        pipeline = Pipeline(name="test_runid", pipeline_database=db)
-        with pipeline:
+        job = PipelineJob(name="test_runid", store=db)
+        with job:
             pod(source, label="ident")
 
         obs = StatusObserver(status_database=db)
-        orch = SyncPipelineOrchestrator()
-        # Pass run_id via the orchestrator's run() method directly
-        orch.run(pipeline._node_graph, observer=obs, run_id="my-custom-run-id")
+        job.run(observer=obs)
 
         status = obs.get_status()
 
+        # run_id is auto-generated by PipelineJob.run(); verify it is populated
+        # and consistent across all status rows for this run.
         run_ids = set(status.column("_status_run_id").to_pylist())
-        assert run_ids == {"my-custom-run-id"}
+        assert len(run_ids) == 1
+        (run_id,) = run_ids
+        assert run_id is not None
+        assert len(run_id) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +473,6 @@ def test_status_observer_from_config_round_trip():
 
 def test_contextualize_with_empty_path_raises():
     """contextualize() with no args should raise ValueError (not silently use fallback)."""
-    import pytest
     db = InMemoryArrowDatabase()
     obs = StatusObserver(db)
     with pytest.raises(ValueError, match="non-empty identity_path"):

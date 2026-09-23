@@ -13,6 +13,205 @@ Each item has a status: `open`, `in progress`, or `resolved`.
 
 ---
 
+## Cross-cutting
+
+### CC1 — Empty tables lose field nullability, aborting `error_policy="continue"` pipelines
+**Status:** resolved
+**Severity:** high
+**Issue:** ITL-563
+
+Five sites construct empty PyArrow tables by building a dict of `pa.array([], type=...)` and
+passing it to `pa.table()`. Because `pa.table(dict_of_arrays)` marks every field
+`nullable=True`, required fields (`str`, `int`, …) lose their non-nullable annotation.
+When a failing function's empty output is fed into a `Join`, the mismatched schemas raise an
+`InputValidationError` that bypasses `error_policy="continue"` and aborts orchestration.
+
+Sites: `sync_orchestrator.py:_materialize_as_stream`, `operator_node.py:_make_empty_table`,
+`side_effects.py:SideEffectPodStream.as_table`,
+`side_effects.py:SideEffectNode.as_table`,
+`derived_source.py:DerivedSource._get_stream`.
+
+**Fix:** Extracted `arrow_utils.make_empty_table(python_schema, type_converter)` using
+`python_schema_to_arrow_schema` + `pa.Table.from_batches([], schema=...)`. Replaced all five
+buggy sites: `sync_orchestrator._materialize_as_stream`, `operator_node._make_empty_table`,
+`SideEffectPodStream.as_table`, `SideEffectNode.as_table`, and `DerivedSource._get_stream`.
+Also fixed a latent null-typed array bug in `Join.static_process`. Added unit tests,
+integration test for the exact bug topology, and per-site regression tests. PR: ITL-563.
+
+---
+
+## `src/orcapod/core/nodes/source_node.py`
+
+### SJN1 — `SourceJobNode.async_iter_data()` wraps `iter_data()` synchronously, bypassing `PollingSource` polling loop
+**Status:** resolved
+**Severity:** high
+**Issue:** ITL-615
+
+`SourceJobNode` does not override `async_iter_data()`. The base-class
+`SourceNodeBase.async_iter_data()` wraps `self.iter_data()` (sync) as an async generator,
+so `bound_source.async_iter_data()` is never called. For `PollingSource`,
+`iter_data()` returns a static single-batch snapshot — the async polling loop is never started.
+This contradicts the stated intent of `async_execute`'s own docstring.
+
+**Fix:** Added `SourceJobNode.async_iter_data()` in `source_node.py` that delegates to
+`self._bound_source.async_iter_data()`, consistent with the existing delegation pattern of
+`iter_data()`, `output_schema()`, and `as_table()`. Also fixed `PollingSource.output_schema()`
+and `keys()` to use the cached ``accumulated_stream`` directly when available, avoiding a
+``_run_sync`` poll that races with the async polling loop (see PS1 below). Added integration
+test `test_polling_source_pipeline_integration.py`.
+
+---
+
+## `src/orcapod/core/sources/polling_source.py`
+
+### PS1 — `PollingSource.output_schema()` and `keys()` trigger `_run_sync` concurrently with the async polling loop, advancing the cursor and skipping batches
+**Status:** resolved
+**Severity:** high
+**Issue:** ITL-615
+
+`PollingSource.output_schema()` and `keys()` fall through to `_get_latest_stream()` whenever
+either ``columns is not None`` or ``all_info=True``. `_get_latest_stream()` calls
+`_run_sync(self._impl.poll, ...)` which spawns a `ThreadPoolExecutor` thread that runs
+`asyncio.run(poll(...))`. This thread advances `self._cursor` independently of the async
+polling loop in `async_iter_data()`.
+
+The trigger is `FunctionJobNode.async_execute()` (line 2325 of `function_node.py`):
+
+```python
+tag_schema = self._input_stream.output_schema(columns={"system_tags": True})[0]
+```
+
+This is called once per `async_execute` invocation, which runs concurrently with the
+source node's `async_execute` (both live inside the orchestrator's outer ``TaskGroup``).
+Because ``columns`` is not ``None``, the old fast-path was missed, `_get_latest_stream()`
+ran its poll+fetch cycle in a background thread, advancing the cursor from 0 → 1. When
+the async polling loop then resumed at its next tick, it called ``poll(cursor=Cursor(1))``,
+found no more data, and exited — processing only the first batch.
+
+**Fix:** `output_schema()` and `keys()` now return from declared schemas directly when both
+``tag_schema`` and ``data_schema`` were provided at construction and ``columns is None`` with
+``all_info=False`` (removing the previous ``accumulated_stream is None`` guard from the
+fast-path condition). When ``accumulated_stream`` is already populated (at least one batch
+fetched by either path), the existing stream is used to answer schema queries without
+triggering a new poll+fetch cycle. Schema is invariant across batches (enforced by
+``_validate_combining_schemas``), so this is always correct. Schema is now declared by
+``impl.schema()`` (returning a unified column schema split by ``tag_columns``) rather than by
+``PollingSource`` constructor params.
+
+### PS2 — Concurrent iteration over a single `PollingSource` has unguarded cursor/stream mutation
+**Status:** open
+**Severity:** high
+**Issue:** ITL-625
+
+`PollingSource` maintains shared mutable state (`_cursor` and `_accumulated_stream`) that is
+updated without synchronization. Two simultaneous callers of `async_iter_data()` (or one async
+and one sync caller) can therefore race:
+
+- **Cursor interleaving** — both callers call `impl.poll(cursor=self._cursor)` concurrently.
+  One receives a new cursor and advances `self._cursor`. The other then calls
+  `impl.fetch(new_cursor)` instead of the cursor it intended.
+- **Accumulated-stream clobbering** — `self._accumulated_stream = self._combine(...)` may be
+  assigned by both callers, with one overwriting the other's in-flight result.
+
+The iteration order guarantee — drain accumulated stream first, then poll from saved cursor —
+is correct for a single caller, but breaks under concurrent callers because neither the drain
+nor the advance is atomic.
+
+**Fix:** Guard updates to `_cursor` and `_accumulated_stream` with an `asyncio.Lock` (async
+path) and a `threading.Lock` (sync path, or use a single lock exposed via `_run_sync`). The
+pre-seed loop in `async_iter_data` should take a snapshot of `_accumulated_stream` under the
+lock before iterating, so later writes to the stream don't affect the snapshot mid-yield.
+
+---
+
+### PS3 — `_combine` leaks `_content_hash` into the data schema on the second accumulating fetch
+**Status:** resolved
+**Severity:** high
+**Issue:** ITL-616
+
+`_combine` calls `as_table(all_info=True)` on both streams before concatenating them.
+`all_info=True` resolves to `ColumnConfig.all()`, which includes `content_hash=True`.
+In `ArrowTableStream.as_table()`, `content_hash=True` dynamically appends a `_content_hash`
+column to the output table. This is a synthetic column — computed on demand, not stored in
+`ArrowTableStream._table`.
+
+`pa.concat_tables` then includes `_content_hash` in the combined table, which is passed
+directly to `ArrowTableStream.__init__`. Since `_content_hash` has no recognized prefix
+(`_tag::`, `_source_`, `_context_key`), it lands in `_data_columns` as if it were user data.
+
+On the next `_combine` call, `_validate_combining_schemas` compares:
+- `existing.keys()` → includes `_content_hash` in data keys (baked in from previous combine)
+- `new_stream.keys()` → no `_content_hash` (freshly built from raw fetched data)
+
+This raises `SchemaInconsistencyError`. A polling source emitting one new row per poll will
+change its data schema on the second new-data poll and crash on the third.
+
+**Fix:** Added `_STREAM_COMBINE_COLUMNS = ColumnConfig(system_tags=True, source=True, context=True)` constant and replaced `as_table(all_info=True)` with `as_table(columns=_STREAM_COMBINE_COLUMNS)` in `_combine`. `content_hash` is intentionally excluded — it is a synthetic output column, never a stored one.
+
+---
+
+### PS4 — Concurrent sync access during async run silently loses rows
+**Status:** resolved
+**Severity:** critical
+**Issue:** ITL-617
+
+`_get_latest_stream()`, called by `iter_data()` or `as_table()` while
+`async_iter_data()` is running, could advance `_cursor` and fold new rows into
+`_accumulated_stream` without the async loop emitting them — permanent silent data
+loss. `ITL-615` (PR #255) partially addressed this for `output_schema()` and `keys()`
+by caching the stream reference. `ITL-617` fixes the root.
+
+**Fix:** Replaced single `_accumulated_stream: ArrowTableStream | None` with
+append-only `_batches: list[ArrowTableStream]` and `_state_lock: threading.Lock`.
+All callers (sync and async) use an optimistic lock protocol: snapshot cursor (brief
+lock) → perform I/O freely with no lock held → commit only if cursor is unchanged
+(brief lock). The async loop tracks its yield position with a per-iterator
+``local_batch_idx`` local variable and drains ``_batches`` at the top of each
+iteration, ensuring rows committed by a concurrent sync caller are yielded even when
+the async loop loses the commit race. The lock is never held across ``await``.
+
+---
+
+### PS5 — `PollingSource` re-infers Arrow schema nullability per batch, crashing on zero-row polls
+**Status:** resolved
+**Severity:** high
+**Issue:** ENG-952
+
+`_build_stream_from_df` called `infer_schema_nullable` on every batch. A zero-row batch has
+`null_count == 0` for all columns, so every field was inferred non-nullable.
+`_validate_combining_schemas` then rejected the batch against the accumulated stream's
+nullable schema.
+
+**Fix:** `_build_stream_from_df` now establishes a `_canonical_arrow_schema` exactly once —
+from `impl.schema()` when declared (no inference, no warning), or from the first non-empty
+batch otherwise (with a `WARNING`-level log). All subsequent batches are cast to the canonical
+schema by column name. Per-batch nullability inference is eliminated. Zero-row frames before
+canonical schema establishment are skipped on the infer-once path.
+
+---
+
+## `src/orcapod/core/nodes/function_node.py`
+
+### FN1 — `FunctionNodeBase.as_table()` returned empty schema when no data existed
+**Status:** resolved
+**Severity:** high
+**Issue:** ENG-572
+
+`as_table()` on an unrun node returned a zero-row table with no columns because
+the `if not all_tags: self._cached_output_table = pa.table({})` assignment was
+immediately overwritten by the fall-through `hstack_tables` call with
+`schema=None`.
+
+**Fix:** Restructured `as_table()` to derive schema from `self.output_schema()`
+upfront and branch immediately on empty vs. non-empty, so the empty case creates
+a properly-schemed zero-row table. Extracted column-filtering logic into
+`arrow_utils.apply_column_config()` standalone function.  Also fixed
+`DATACLASS_TYPE_FIELD` sentinel rename (`__type` → `__dataclass.`) and
+`arrow_schema_to_python_schema` returning `Any` for dataclass structs
+(now synthesizes a concrete dataclass type).
+
+---
+
 ## `src/orcapod/core/base.py`
 
 ### B1 — `PipelineElementBase` should be merged into `TraceableBase`
@@ -97,11 +296,15 @@ logic entirely.
 ---
 
 ### P4 — `PythonDataFunction` computes the output schema hash twice
-**Status:** open
+**Status:** resolved
 **Severity:** low
 `__init__` stores `self._output_schema_hash` (line ~289). `DataFunctionBase` also lazily
 caches `self._output_data_schema_hash` (different attribute name) via
 `output_data_schema_hash`. Two fields holding the same value. One is redundant.
+
+**Fix:** Removed the eager `self._output_schema_hash` assignment from
+`PythonDataFunction.__init__`. The canonical schema hash is now computed and cached exclusively
+by `DataFunctionBase.output_data_schema_hash` (stored in `_output_data_schema_hash`).
 
 ---
 
@@ -170,12 +373,17 @@ implementation.
 ---
 
 ### F3 — Dual URI computation paths in the class hierarchy
-**Status:** open
+**Status:** resolved
 **Severity:** low
 `TrackedDataFunctionPod.uri` assembles the URI from `self.data_function.*` with its own lazy
 schema-hash cache. `WrappedFunctionPod.uri` simply delegates to `self._function_pod.uri`. These
 should agree (and do, after the `data_function` fix), but having two independent implementations
 makes future changes fragile.
+
+**Fix:** Removed `_output_schema_hash` cache from `_FunctionPodBase.__init__` and replaced the
+`uri` property body with `return self.data_function.uri`. `_FunctionPodBase.uri` now delegates
+to `DataFunctionBase.uri`, which owns the canonical hash computation and caching via
+`output_data_schema_hash`.
 
 ---
 
@@ -215,13 +423,18 @@ is `self`.
 ---
 
 ### F7 — TOCTOU race in `FunctionPodNode.add_pipeline_record`
-**Status:** open
+**Status:** resolved
 **Severity:** medium
 The method checks for an existing record with `get_record_by_id` and skips insertion if found.
 But it then calls `add_record(..., skip_duplicates=False)`, which will raise on a duplicate. A
 race between the lookup and the insert (e.g. two concurrent processes handling the same tag+data)
 would cause a crash instead of a graceful skip. Should use `skip_duplicates=True` for consistency
 with the intent.
+
+**Fix:** ITL-508 redesigned `add_pipeline_record` to use indexed entry-ID versioning
+(`max_index + 1`) with `skip_duplicates=True` on the versioned key. The
+`skip_cache_lookup` parameter was removed entirely, eliminating both the TOCTOU
+window and the stale-entry silent-skip failure described in ITL-513.
 
 ---
 
@@ -237,17 +450,23 @@ grouping. It should be co-located with `function_pod` or moved to the protocols 
 **Status:** open
 **Severity:** high
 
-`_validate_input_schema()` (line ~162) raises a generic `ValueError` when the data schema
-is incompatible:
+`_validate_input_schema()` in `_FunctionPodBase` raises a generic `ValueError` when the
+incoming data schema is incompatible with the function's expected input schema:
 ```python
 # TODO: use custom exception type for better error handling
+raise ValueError(
+    f"Incoming data data type {input_schema} is not compatible with ..."
+)
 ```
 
-The codebase already has `InputValidationError` (in `errors.py`) which is the correct exception
-for this case. Using `ValueError` means callers cannot distinguish schema incompatibility from
-other value errors without string-matching the message.
+Using `ValueError` means callers cannot distinguish schema incompatibility from other value
+errors without string-matching the message.
 
-Fix: change `ValueError` to `InputValidationError`.
+Fix: define a new `SchemaCompatibilityError` (subclass of `InputValidationError`) in
+`errors.py` and raise it from `_validate_input_schema()`. The existing
+`SchemaInconsistencyError` covers batch/polling-source schema drift; this new type covers
+function-pod input schema mismatch. Name the exception to reflect the cause:
+incompatible upstream stream schema vs. function's expected input schema.
 
 ---
 
@@ -312,6 +531,36 @@ to load already-computed (tag, output-data) pairs from the databases (mirroring 
 `INPUT_PACKET_HASH` values and only call `process_data` for input data not yet in the DB.
 Also added `FunctionPodNode.get_all_records(columns, all_info)` using `ColumnConfig` to control
 which column groups (meta, source, system_tags) are returned.
+
+---
+
+### F15 — `FunctionPod` has no pod-level error policy; sync and async paths are inconsistent
+**Status:** open
+**Severity:** high
+**Issue:** ITL-527
+
+`FunctionPod` has no `on_error` configuration. The two execution paths behave differently:
+
+- **Sync path** (`FunctionPodStream._iter_data_*`): no exception handling at all — exceptions
+  propagate unconditionally out of the iterator.
+- **Async path** (`_FunctionPodBase.async_execute()`): exceptions are caught, the observer is
+  notified via `on_data_crash()`, and the item is **silently dropped from output** with no
+  indication to the caller and no way to configure this behaviour.
+
+The node-level `FunctionJobNode.execute()` adds `error_policy: Literal["continue", "fail_fast"]`,
+but this is only available for DB-backed execution and uses different vocabulary from the rest
+of the framework.
+
+`SinkPod` and `TapPod` (ITL-524/ITL-525) introduced a clean `on_error: Literal["raise", "log"]`
+vocabulary at the pod level. `FunctionPod` should adopt the same model: pod-level `on_error`
+config, consistent behaviour between sync and async paths, and the same `"raise"` / `"log"`
+vocabulary.
+
+**Fix needed:** Add `on_error: Literal["raise", "log"] = "raise"` to `FunctionPodConfig` (or
+equivalent). In the async path, replace the unconditional silent-drop with the configured
+behaviour: `"raise"` propagates the exception; `"log"` logs at `WARNING` and drops the item
+(current behaviour, but now explicit and configurable). Align `FunctionJobNode.error_policy`
+to use the same vocabulary.
 
 ---
 
@@ -488,6 +737,148 @@ Three categories of improvement are planned:
 **Remaining:** `PolarsFilter` (barrier), `MergeJoin` (barrier) could receive incremental
 overrides in the future but require careful handling of Polars expression evaluation and
 system-tag evolution respectively.
+
+`GroupBy` (NPIPE-204) is barrier-only by construction and is not a candidate for either category:
+no group can be emitted before the input channel closes, because any row not yet seen could belong
+to a group already started. Emitting early would require a guarantee that input arrives clustered
+by group key, which orcapod streams do not carry.
+
+---
+
+### O2 — Operators silently discard a non-default `_context_key`
+**Status:** open
+**Severity:** medium
+
+Every operator reads its input with
+`stream.as_table(columns={"source": True, "system_tags": True})` — `batch.py:48`,
+`merge_join.py:168`, `semijoin.py:60`, `column_selection.py:524`. That column set excludes
+`_context_key`, so no operator ever sees the input's data context. `ArrowTableStream.__init__`
+then finds no context column on the result and substitutes
+`contexts.get_default_context_key()`.
+
+Consequence: a stream carrying a non-default context key reverts to the default at the first
+operator it crosses, with no warning. Function pods are unaffected — only the operator layer.
+
+This is pre-existing and layer-wide rather than specific to any one operator. It may also be
+intended (operators produce output in the ambient context rather than inheriting an input's), in
+which case the fix is to document the rule rather than change behavior. Logged while working
+NPIPE-204; deliberately not addressed there.
+
+Fix: decide whether operator output should inherit the input context. If yes, request
+`context: True` and propagate it, erroring when inputs disagree. If no, document the reset
+explicitly on `StaticOutputPod`.
+
+---
+
+### O3 — `_materialize_to_stream` broadcasts row 0's provenance to every row
+**Status:** open
+**Severity:** high
+
+`StaticOutputOperatorPod._materialize_to_stream` (`core/operators/static_output_pod.py:223`)
+reads the source info of the *first* row and applies it to the whole concatenated table:
+
+```python
+# Preserve actual source_info provenance from the first row
+# (all rows share the same data columns and source tokens).
+source_info = rows[0][1].source_info()
+```
+
+The comment is half right. All rows do share the same data *column names*, but not the same
+*tokens* — a provenance token embeds a per-row identifier (`...::row_0::value` versus
+`...::row_1::value`, built by `_make_provenance_token` in `core/sources/stream_builder.py`).
+So every row from index 1 onward is attributed to row 0. `sync_orchestrator.py:207,222`
+repeats the pattern.
+
+Observed directly in a `MergeJoin` round-trip: row 1 of the output carried `row_0` tokens.
+
+This predates NPIPE-204 and is equally wrong for scalar tokens, so nothing in that change
+caused it. NPIPE-204 did make it **more visible**: previously the list-valued case crashed at
+`as_table` (see U1), so a broken operator never got far enough to mis-attribute provenance.
+That crash is now fixed, which converts a loud failure into a quiet wrong answer.
+
+Fix: build the source-info mapping per row rather than once from row 0, or push the
+provenance into the concatenated table before constructing the stream.
+
+---
+
+### O4 — `GroupBy` member order is undefined for duplicate tag tuples
+**Status:** open
+**Severity:** medium
+
+`GroupBy` sorts a group's members by their non-group-key tag values so the emitted lists are
+stable across runs — orcapod hashes those lists to build the cache key, so an unstable order
+causes spurious recomputes.
+
+When `by` covers *every* tag column there is no non-key tag left to sort on, and the operator
+falls back to the system `record_id`. That is a UUID v5 over the source id and a per-row
+provenance token, so it encodes source *row position*. Permuting the source table therefore
+changes member order, changes the list hash, and triggers a recompute. Measured: 79 distinct
+member orders across all 120 permutations of a 5-row duplicate-tag input.
+
+The branch is reachable with more than one member only when the input contains **duplicate tag
+tuples** — `sort_columns` is empty exactly when the group key is the full tag tuple, so a
+multi-member group requires duplicates.
+
+This is not fixable inside `GroupBy`. The only remaining ordering signal is data content, and
+the operator / function pod boundary forbids an operator from inspecting data.
+
+The real root cause is upstream: `DuplicateTagError` (`errors.py:23`) is defined but **never
+raised anywhere** in `src/` or `tests/`, so duplicate tag tuples are not prevented in the first
+place. Tag uniqueness is assumed throughout the operator layer and enforced nowhere.
+
+Fix: enforce tag uniqueness at stream construction (raising `DuplicateTagError`), which makes
+this branch unreachable with more than one member.
+
+---
+### O5 — A reduction persists a result computed from an incomplete member set
+**Status:** open
+**Severity:** high
+
+When an upstream pod's output changes, the first `job.run()` afterwards emits only the rows
+that were recomputed in that pass. For a per-row pod that emission is *complete* — each row is
+independent, so processing just the changed one is correct. For a many→one operator it is
+*partial*: the group is reduced over only the members present in that pass, the reducing pod
+executes, and its result is persisted with nothing marking it incomplete. The next run emits
+the full set and the group is recomputed correctly.
+
+Measured with two upstream pod stages (`source → sync_like → stringify → [GroupBy] → pod`),
+one member of one group changed, same Delta store, fresh objects per run:
+
+```
+CONTROL (per-row, no GroupBy)
+  changed run1   sync_like(99), stringify(sync_99), pod(sync_99.parquet)   <- converged
+  changed run2   []
+
+GROUPED
+  changed run1   sync_like(99), stringify(sync_99), GROUP ['sync_99']      <- ONE member
+  changed run2   GROUP ['sync_99', 'sync_1']                              <- correct
+  changed run3   []
+```
+
+The control converges in a single run; only the grouped path needs a second one, and it
+executes on an incomplete set first.
+
+Consequence: a reducing pod with a side effect writes a complete-looking artifact from partial
+input. For the motivating consumer (`common_clock_op`) an intermediate run can produce an
+`alignment.json` built from one of a session's probes. It is replaced on the next run, so a
+driver that runs to convergence never observes it — but a consumer reading between runs gets a
+wrong answer with no signal.
+
+`Batch` behaves identically, so this is pre-existing pipeline semantics surfaced by reduction
+rather than something `GroupBy` introduced. It is more consequential for `GroupBy`, because
+`GroupBy` exists specifically so a pod can reason over a *complete* group, whereas nobody
+derives a result from `Batch` membership.
+
+Not fixable inside the operator: an operator sees whatever its upstream emits and has no way to
+know whether a group is complete. A fix needs a completeness signal at the node level — either
+the upstream emitting its full cached set on every pass, or a reducing node deferring execution
+until its inputs are known settled.
+
+History: first reported as a cache-corruption bug (wrong group recomputing, tag/data
+misalignment), then retracted as a propagation lag "identical with and without `GroupBy`". Both
+framings are wrong. There is no tag/data misalignment and no cache defect — but the control
+above shows the behaviour is *not* identical, because a partial emission is harmless per-row
+and harmful for a reduction.
 
 ---
 
@@ -725,6 +1116,39 @@ behavior configurable (warn, error, or silent).
 
 ---
 
+### D8 — Cache lookups crash on `string_view` columns (missing PyArrow comparison kernels)
+**Status:** in progress
+**Severity:** high
+**Issue:** ENG-601
+
+`get_records_with_column_value()` pushes a filter predicate into a PyArrow scan
+(`_read_delta_table`, line ~852: `dataset.to_table(filter=filter_expr)`). When a stored
+string column is physically typed `string_view`, the scan crashes — PyArrow (verified on
+both 23.0.1 and 24.0.0) has no comparison kernels (`equal` / `greater_equal` / `less_equal`)
+for `string_view`:
+```
+pyarrow.lib.ArrowNotImplementedError: Function 'greater_equal'
+  has no kernel matching input types (string_view, string_view)
+```
+This breaks every `ResultCache.lookup()`, so any rerun that hits already-stored records fails
+(discovered in the spike-sorting pipeline: probes that succeeded on a first run failed on
+rerun). `string_view` enters via `polars.DataFrame.to_arrow()`, which returns `large_string`
+by default in polars 1.41.2 but `string_view` at `compat_level=newest` (newer polars makes it
+the default). orcapod calls plain `df.to_arrow()` across the write path and never normalizes
+`string_view` → `large_string` before persisting: `normalize_to_large_types` has no
+`string_view` branch and is not applied on the write path. `as_large_types=True` only relabels
+the advertised schema; the scanner still feeds `string_view` data to the predicate. No test
+exercises `string_view`.
+
+**Fix:** (read-side, primary) cast `string_view` → `large_string` after read / before
+filtering and sorting in `_read_delta_table` — repairs already-persisted data and is agnostic
+to the producer; also protects the `sort_by` / `take` path in `ResultCache.lookup`.
+(write-side, hardening) add a `string_view` branch to `normalize_to_large_types` and normalize
+before persisting so stored schemas stay canonical. Regression test: a Delta table whose filter
+column is physically `string_view`, asserting `get_records_with_column_value` succeeds.
+
+---
+
 ## `src/orcapod/hashing/`
 
 ### H1 — `FunctionSignatureExtractor` ignores `input_types` and `output_types` parameters
@@ -789,18 +1213,69 @@ Should be removed in the next breaking release. Consider adding deprecation warn
 
 ---
 
+### H5 — `_process_table_columns` materializes extension columns to Python even with no handler
+**Status:** open
+**Severity:** medium
+**Issue:** ITL-433
+
+`StarfixArrowHasher._process_table_columns` calls `to_pylist()` on every extension-typed
+column before running `SemanticHashingVisitor`. For columns whose Python type has no registered
+semantic handler (pydantic models, dataclasses, any unhandled extension type), the visitor
+returns the value unchanged and the data is immediately re-serialized back to Arrow. The Python
+roundtrip serves no purpose in this case and is O(rows) deserialization work wasted.
+
+The fix is to short-circuit at the column level: before calling `to_pylist()`, check whether
+`type_handler_registry.has_handler(python_type)` would be True for this column's extension
+type. If not, call `normalize_extension_columns()` directly on the Arrow column (uses
+`ExtensionArray.storage`, no Python materialization) and skip the visitor loop entirely.
+Columns with a registered handler (e.g. `Path`) continue through the existing path unchanged.
+
+The `normalize_extension_columns` utility landed in ITL-432.
+
+---
+
 ## `src/orcapod/utils/`
 
 ### U1 — Source-info column type hard-coded to `large_string`
-**Status:** open
+**Status:** resolved (`tag_data.py` half), open (`arrow_utils.py` half)
 **Severity:** critical
 
-In `add_source_info_to_table()` (`arrow_utils.py:604`), when source info is a collection it is
-unconditionally cast to `pa.list_(pa.large_string())`:
+Two sibling call sites assume source-info values are always scalar strings.
+
+**`Data._ensure_source_info_table()` (`core/datagrams/tag_data.py:330`)** builds the Arrow schema
+as `pa.field(k, pa.large_string())` for every key, and `Data.schema()` (line ~384) reports `str`
+for every `_source_*` column. Any operator that produces list-valued source info therefore fails
+inside `job.run()`:
+
+```
+pyarrow.lib.ArrowTypeError: Expected bytes, got a 'list' object
+  core/datagrams/tag_data.py:342  _ensure_source_info_table
+```
+
+Two operators hit this: `MergeJoin`, which carries source columns along as parallel lists when
+merging colliding data columns (`merge_join.py:262`), and `Batch`, which list-wraps every column.
+Both were reproduced against `966d759a`.
+
+**Fix:** landed in NPIPE-204 (`1b570e68`, `1ed22ee4`). `_source_info_arrow_type` and
+`_source_info_python_type` in `core/datagrams/tag_data.py` derive the Arrow and Python types
+from the stored value — `str`/`None` → `large_string`, list → `large_list(<elem>)`
+recursively. The `SourceInfoValue` alias lives in `types.py` next to `TagValue`/`DataValue`,
+which lets `DataProtocol` and `ArrowTableStream` reference it without inverting the
+`protocols/` → `core/` layering. No pipeline-DB schema bump: a node's source-column type is
+fixed by its own output schema, so existing nodes keep `large_string`. Job-level regression
+coverage is in `tests/test_pipeline/test_aggregation_job.py`. See
+`superpowers/specs/2026-08-07-npipe-204-batch-group-by-design.md`.
+
+A third site, `polars_data_utils.add_source_info` (line 119), forces `dtype=pl.String()`. It is
+dead code — nothing in `src/` calls it, and the tests importing `add_source_info` import it from
+`arrow_utils` — and it carries a latent shadowing bug where `source_column` is rebound to a
+`pl.Series` inside the per-column loop. NPIPE-204 deletes it rather than fixing it.
+
+**Still open:** in `add_source_info_to_table()` (`arrow_utils.py:604`), when source info is a
+collection it is unconditionally cast to `pa.list_(pa.large_string())`:
 ```python
 # TODO: this won't work other data types!!!
 ```
-
 Any non-string collection values will fail or silently corrupt data. The logic also has an
 unclear nested isinstance check (line ~602: `# TODO: clean up the logic here`).
 
@@ -934,3 +1409,274 @@ Open questions:
    context override?
 
 ---
+
+## `src/orcapod/logical_types/`
+
+### ET1 — `make_polars_extension_type` cannot accept a storage type containing nested extension types
+**Status:** open
+**Severity:** medium
+
+`make_polars_extension_type` computes the Polars storage dtype by calling:
+```python
+pl.from_arrow(pa.array([], type=arrow_storage_type)).dtype
+```
+This fails with `ArrowNotImplementedError: extension` when `arrow_storage_type` is a struct
+(or list) whose fields include any `pa.ExtensionType` node — for example, a dataclass whose
+fields include `uuid.UUID` (stored as `orcapod.uuid` extension over `pa.large_binary()`).
+
+Polars's Arrow IPC bridge handles top-level extension types via `pl.BaseExtension`, but has no
+path for extension types *nested inside* a struct at dtype-inference time.
+
+**Workaround:** `register_python_class` and `register_storage_type` both uphold a
+*storage-safe* invariant: the returned type may be a `pa.ExtensionType` at the top level,
+but struct fields and list value types at any depth are always plain (non-extension) types.
+`DataclassLogicalTypeFactory.create_for_python_type` strips the top-level extension type
+with a one-liner (`if isinstance(arrow_type, pa.ExtensionType): arrow_type = arrow_type.storage_type`)
+before inserting it into the struct, so the struct passed to `make_polars_extension_type`
+and `pa.Table.from_pylist` never contains nested extension types. The private
+`_strip_ext_to_storage` recursive helper was removed in PLT-1720; the stripping is now
+trivially correct because the storage-safe invariant guarantees `.storage_type` is always
+already clean.
+
+**Also affects `pa.Table.from_pylist`:** the same restriction applies to PyArrow's
+`pa.Table.from_pylist` (and `pa.array`) — neither can build an array from a struct type
+whose fields are `pa.ExtensionType` nodes, for the same underlying reason. The stripping
+in `create_for_python_type` fixes both issues simultaneously.
+
+**Polars round-trip fidelity:** once the storage struct contains only plain types (no
+nested extension types), the full Arrow → Polars → Arrow round-trip for the *outermost*
+extension type is faithful: extension name, metadata bytes, and storage struct are all
+preserved. Only the inner field schema (already stripped) is absent.
+
+**Fix needed:** Once PyArrow (and Polars) support nested extension types natively in struct
+construction and Arrow↔Polars conversion, the stripping one-liner in `create_for_python_type`
+can be removed and `make_polars_extension_type` can accept extension-typed storage directly.
+Track upstream PyArrow / Polars issues.
+
+### ET2 — Top-level `list[T]` / `dict[K, V]` columns lose extension-type schema metadata when `T`/`V` is a logical type
+**Status:** in progress
+**Severity:** medium
+**Issue:** PLT-1732
+
+When a logical type (e.g. `UUID`, a dataclass) appears as the element type of a `list[T]`
+or `dict[K, V]` annotation, `register_python_class` now raises `ValueError` at
+schema-construction time rather than silently stripping the extension type. The underlying
+cause is that PyArrow does not allow extension types inside list value fields or struct
+fields (ET1): `pa.array([], type=pa.large_list(extension_type))` raises
+`ArrowNotImplementedError: extension`. If a caller manually strips to storage types and
+writes `large_list(large_binary)` for `list[UUID]`, the stored Arrow schema carries no
+`orcapod.uuid` marker; on a fresh read `register_storage_type` finds nothing to register,
+and value conversion with `storage_to_python(..., list[UUID])` fails unless `UUID` was
+registered manually beforehand.
+
+**This does NOT affect logical types that are fields of a registered outer dataclass.**
+Those are discovered and registered transitively: `register_discovered_extensions` finds
+the outer dataclass extension type → `reconstruct_from_arrow` → `register_python_class`
+per field annotation → inner type registered. The limitation applies only when the
+outermost container (`list[T]`, `dict[K, V]`) is the top-level column type with no outer
+dataclass wrapper.
+
+**Empirically confirmed** (2026-06-17): `pa.array([], type=pa.large_list(extension_type))`
+raises `ArrowNotImplementedError: extension` — identical to the ET1 struct-field
+restriction. The `replace_logical_type` flag approach (preserving extension type inside
+list value field) is therefore infeasible at the PyArrow level.
+
+**Current behaviour:** `register_python_class(list[T])` raises `ValueError` when `T`
+resolves to a logical type, pointing to this entry and PLT-1732. Use a direct `T` column
+(no list wrapper) or wrap the list inside a dataclass field — the outer dataclass extension
+type carries the annotation into the schema, and `reconstruct_from_arrow` re-registers `T`
+transitively on read.
+
+**Operator layer (NPIPE-204):** `Batch` and `GroupBy` previously called
+`pa.list_(field.type)` directly, so they raised `ArrowNotImplementedError: extension` on any
+extension-typed column even after ITL-173 landed `ListLogicalType`. Both now build their
+output through `arrow_utils.build_aggregated_table`, which constructs the list over the
+element's storage type and wraps it in the outer `list[<element>]` extension type. A pod
+annotated `-> Path` groups into `list[orcapod.path]` and the downstream pod receives real
+`Path` objects.
+
+**Planned fix (PLT-1732, target v0.2):** Introduce `ListLogicalType` /
+`ListLogicalTypeFactory` and `StructLogicalType` / `StructLogicalTypeFactory`. A
+`list[UUID]` top-level column would be wrapped as a new extension type
+`orcapod.list[orcapod.uuid]` with storage `large_list(large_binary)`. The extension type
+sits at the outermost (list) level, not inside the list value field, so it satisfies ET1.
+`register_storage_type` would dispatch to the new factory on read, auto-registering the
+element type. See PLT-1732 for full design.
+
+**Partial fix (ITL-173):** Introduced `ListLogicalType` and `ListLogicalTypeFactory` in
+`src/orcapod/extension_types/list_logical_type_factory.py`. The entire
+`list[T]`/`set[T]` is wrapped as a top-level Arrow extension type with storage
+`large_list(<T storage>)`, embedding element reconstruction metadata in the
+field-level metadata JSON. Wired into `_register_python_class_impl` and
+`_convert_python_to_arrow` via `_make_or_get_list_logical_type`. Registered in
+`v0.1.json` under categories `"list"` and `"set"`. Resolves the `list[T]`/`set[T]`
+case. `dict[K, V]` with extension-type keys or values remains unsupported (raises
+``ValueError``); tracked in PLT-1732.
+
+---
+
+## `src/orcapod/databases/connector_arrow_database.py`
+
+### CA1 — SQL connectors silently lose Arrow extension-type field metadata on round-trip
+**Status:** in progress
+**Severity:** high
+**Issue:** PLT-1795
+
+`SQLiteConnector` (and any `DBConnectorProtocol` implementation that maps Arrow → SQL types)
+does not preserve `ARROW:extension:name` / `ARROW:extension:metadata` field metadata. When a
+column whose Arrow type is a `pa.ExtensionType` (e.g. `orcapod.path`, `orcapod.uuid`, or any
+dataclass extension type) is written via `ConnectorArrowDatabase.add_records()` and then read
+back, the column is returned as the raw storage type (e.g. `large_string`, `large_binary`,
+`struct`) with no extension marker. This makes SQL connector round-trips impossible and causes silent data-type loss.
+
+**Interim fix (PLT-1659 / ITL-471):** `DBConnectorProtocol` now declares a `validate_records`
+hook. `SQLiteConnector` and `PostgreSQLConnector` implement it to reject extension-typed columns
+at write time, surfacing the issue immediately rather than on a confusing read. `SpiralDBConnector`
+overrides it as a no-op because it preserves field metadata via the native KV store.
+Two representations are rejected by the SQL implementations:
+- In-memory extension types: `isinstance(field.type, pa.ExtensionType)`.
+- Metadata-only columns: plain storage type whose field metadata contains
+  `b"ARROW:extension:name"` (the representation produced when reading a Parquet/IPC file
+  with an unregistered extension type).
+
+**Full fix (PLT-1795, target v0.2):** Preserve extension-type metadata in the SQL schema via
+a companion metadata table (one row per column: `table_name`, `column_name`,
+`extension_name`, `extension_metadata`). On `create_table_if_not_exists`, write rows for any
+extension-typed columns; on `iter_batches`, join the metadata table and reconstruct the
+`pa.ExtensionType` for affected columns before returning the batch. Once implemented, the
+connectors override `validate_records` to a no-op.
+
+---
+
+### CA2 — Extension-type detection logic duplicated across multiple connectors
+**Status:** open
+**Severity:** low
+
+The `b"ARROW:extension:name"` detection logic (checking both `isinstance(field.type, pa.ExtensionType)`
+and `field.metadata.get(b"ARROW:extension:name")`) is copied verbatim into `SQLiteConnector.validate_records`,
+`PostgreSQLConnector.validate_records`, and `MockDBConnector` in the test files. The constant
+`b"ARROW:extension:name"` also appears inline in `extension_types/schema_walker.py` and other places
+without a single canonical definition.
+
+**Fix:** Extract into a shared helper `_check_extension_fields(schema) -> list[tuple[str, str]]`
+(and/or a module-level constant `_ARROW_EXT_NAME_KEY`) reachable from all connector implementations.
+When SQLite/PostgreSQL implement metadata preservation (PLT-1795), they'll override `validate_records`
+to a no-op — at that point the duplication goes away naturally. Until then, the helper would keep
+the detection logic in one place.
+
+---
+
+## `src/orcapod/semantic_types/universal_converter.py`
+
+### UC1 — `python_type_to_arrow_type` raised on `typing.Any` from empty-container inference
+**Status:** resolved
+**Severity:** medium
+**Issue:** ENG-389
+
+`_infer_list_type` and `_infer_dict_type` in `pydata_utils.py` return `list[Any]` /
+`dict[Any, Any]` when all sampled containers are empty (no elements to inspect). Passing
+these inferred types to `python_type_to_arrow_type` raised `ValueError: Unsupported
+Python type: typing.Any`.
+
+**Fix:** Added `Any: pa.null()` to `_PYTHON_TO_ARROW_MAP` (forward path) and an explicit
+`pa.types.is_null → Any` check to `_convert_arrow_to_python` (reverse path). `pa.null()`
+is Arrow's canonical "unknown/no-type" marker; empty containers have no elements to
+validate, so the encoding is semantically correct. The now-unreachable `Any`-specific hint
+in the error branch was removed.
+
+---
+
+### UC2 — Premature rejection of union-typed function inputs
+**Status:** resolved
+**Severity:** high
+**Issue:** ITL-452
+
+`ensure_types_registered_for_schemas` forwarded each schema annotation directly
+to `register_python_class`, which rejects complex union types (``str | Path``)
+because Arrow has no native union storage type. This caused ``FunctionPod``
+construction to fail with a ``ValueError`` whenever a function declared a
+union-typed input argument, even though union inputs are semantically valid
+(they express that the pod accepts either concrete type, with the concrete
+branch resolved at stream-binding time).
+
+**Fix:** Modified `ensure_types_registered_for_schemas` to detect union
+annotations and register each non-``None`` branch individually, leaving
+``register_python_class`` unchanged (it correctly rejects unions when invoked
+directly for explicit type conversion).
+
+---
+
+### UC3 — Function signature hash order-dependent for union-typed annotations
+**Status:** resolved
+**Severity:** high
+**Issue:** ITL-453
+
+``get_function_signature()`` in ``hash_utils.py`` used ``str(param)`` to build
+the signature string. For union type annotations, ``str(param)`` calls
+``inspect.formatannotation``, which falls through to ``repr(annotation)`` —
+reflecting declaration order. Two semantically identical signatures like
+``foo(x: str | Path)`` and ``foo(x: Path | str)`` therefore produced different
+``_function_signature_hash`` values, silently breaking content addressability
+for any pipeline that refactored union member order.
+
+**Fix:** Added ``_is_union_annotation`` and ``_canonical_annotation_str``
+helpers to ``hash_utils.py``. Union members are now sorted byte-wise by their
+``inspect.formatannotation`` string before being embedded in the signature.
+Applied the same fix to ``FunctionSignatureExtractor.extract_function_info``.
+Also added ``eval_str=True`` to ``inspect.signature()`` so that string
+annotations produced by ``from __future__ import annotations`` (PEP 563) are
+resolved to live type objects before union detection. Non-union annotations are
+byte-for-byte unchanged.
+
+---
+
+## `pyspiral` dependency (SpiralDB integration)
+
+### SP1 — pyspiral 0.11.7 broke against t3.storage.dev header-signing enforcement change
+**Status:** resolved
+**Severity:** high
+**Issue:** PLT-1773
+
+Around 2026-06-15, SpiralDB's object-storage backend (`t3.storage.dev`) began
+strictly enforcing that every header present in a presigned S3-style GET request
+must appear in `X-Amz-SignedHeaders`. pyspiral 0.11.7's embedded Rust HTTP
+client sent additional unsigned headers alongside the presigned URL, causing all
+Vortex file reads to return:
+
+```
+AccessDenied: There were headers present in the request which were not signed
+```
+
+All three `TestSpiralDBConnectorIntegration` tests failed on every CI push from
+2026-06-15 onward. The runner image version was identical between the last green
+and first red run, confirming this was a server-side enforcement change rather
+than a runner regression.
+
+**Fix:** Upgraded pyspiral from `0.11.7` to `0.14.9`. The 0.14.x line rewrote
+the HTTP/auth stack to use Python-level `httpx` instead of the embedded Rust
+client, eliminating the unsigned-header problem. The `pyproject.toml` minimum
+was bumped from `>=0.11.0` to `>=0.14.0` to document the effective floor.
+No connector code changes were needed — the public API is fully compatible
+across this version range.
+
+**Ongoing:** pyspiral releases frequently. See PLT-1785 for the tracking issue
+covering routine version bumps.
+
+---
+
+## `src/orcapod/core/nodes/operator_node.py`
+
+### ON1 — OperatorJobNode has no v0→v1 schema migration for `NODE_CONTENT_HASH_COL`
+**Status:** open
+**Severity:** high
+**Issue:** ITL-539
+
+`OperatorJobNode` stores `NODE_CONTENT_HASH_COL` as `large_binary` (changed in ITL-539),
+but unlike `FunctionJobNode` and `ResultCache`, it has no `_ensure_schema()` guard and no
+v0→v1 migration utility. Any existing pipeline DB written by the old code that stored
+`NODE_CONTENT_HASH_COL` as `large_string` will fail with an Arrow schema mismatch on the
+next write attempt. This is accepted as a breaking change for a pre-v0.1.0 project; users
+must drop and recreate the affected pipeline DB tables manually.
+
+A proper migration utility (analogous to `migrate_pipeline_v0_to_v1`) should be implemented
+before v0.1.0 ship.

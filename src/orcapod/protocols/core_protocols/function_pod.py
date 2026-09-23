@@ -4,6 +4,7 @@ from orcapod.protocols.core_protocols.datagrams import DataProtocol, TagProtocol
 from orcapod.protocols.core_protocols.data_function import DataFunctionProtocol
 from orcapod.protocols.core_protocols.pod import PodProtocol
 from orcapod.protocols.hashing_protocols import PipelineElementProtocol
+from orcapod.types import PodConfig
 
 
 @runtime_checkable
@@ -14,9 +15,17 @@ class FunctionPodProtocol(PodProtocol, PipelineElementProtocol, Protocol):
 
     @property
     def data_function(self) -> DataFunctionProtocol:
-        """
-        The DataFunctionProtocol that defines the computation for this FunctionPodProtocol.
-        """
+        """The ``DataFunctionProtocol`` that defines the computation for this pod."""
+        ...
+
+    @property
+    def pod_config(self) -> PodConfig:
+        """Per-pod executor configuration."""
+        ...
+
+    @property
+    def ctx_arg_name(self) -> str | None:
+        """Parameter name auto-injected with ``InvocationContext``, or ``None``."""
         ...
 
     def process_data(

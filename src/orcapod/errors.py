@@ -5,6 +5,21 @@ class InputValidationError(Exception):
     """
 
 
+class SchemaInconsistencyError(InputValidationError):
+    """Raised when a data batch has a schema that is incompatible with the expected schema.
+
+    This can happen in two situations:
+
+    - A fetched batch is missing a field declared in ``tag_schema`` or ``data_schema``,
+      or one of those fields has a different type than declared.
+    - Consecutive batches from a ``PollingSource`` have different column sets or
+      column types (schema drift between polls).
+
+    ``SchemaInconsistencyError`` is a subclass of ``InputValidationError`` so existing
+    ``except InputValidationError`` handlers continue to work.
+    """
+
+
 class DuplicateTagError(ValueError):
     """Raised when duplicate tag values are found and skip_duplicates=False"""
 
@@ -34,3 +49,149 @@ class FieldNotResolvableError(LookupError):
     """
 
     pass
+
+
+class UnboundSourceError(RuntimeError):
+    """Raised when a data-producing method is called on an unbound SourceNode.
+
+    Occurs when ``iter_data()`` or ``as_table()`` is called on a ``SourceNode``
+    that has not been bound to a concrete source in a ``PipelineJob``.
+    """
+
+
+class SourceSpecMismatchError(ValueError):
+    """Raised when a concrete source's schema is incompatible with a SourceNode slot.
+
+    The class name ``SourceSpecMismatchError`` is preserved for compatibility
+    with any code that catches it by name.
+
+    Contains the slot name and a description of the incompatible field(s).
+    Raised at ``bind()`` time — schema mismatches are rejected before execution.
+    """
+
+
+class InconsistentSourceError(ValueError):
+    """Raised when two source nodes in the same pipeline share a name but differ in schema.
+
+    Source node names are identity-forming: the same name in a given pipeline
+    must always refer to the same input slot (same schema).  If ``compile()``
+    finds two source nodes with identical names but different schemas — which
+    can happen when two ``RootSource`` objects share the same ``source_id`` but
+    produce different column sets — it raises this error rather than silently
+    renaming one of them.
+
+    Resolution: assign distinct ``source_id`` values to the conflicting sources
+    so each slot has a unique, stable identity.
+    """
+
+
+class CursorInvalidatedError(Exception):
+    """Raised by a ``DynamicSourceProtocol`` implementation when the previous
+    cursor is no longer valid and the source state must be rebuilt from scratch.
+
+    This is a terminal condition for ``PollingSource``. Rows already emitted
+    downstream cannot be retracted, so continuing would leave downstream
+    operators with a corrupted view. ``PollingSource`` logs the error, calls
+    ``impl.close()``, and re-raises so the caller receives the exception rather
+    than a silent end-of-stream.
+
+    If full-reset semantics are required, use a static source re-run instead
+    of ``PollingSource``.
+    """
+
+
+class PipelineJobRequiredError(RuntimeError):
+    """Raised when a lightweight blueprint node is asked to produce data.
+
+    Blueprint nodes (``FunctionNode``, ``OperatorNode``) carry no database
+    references.  Wrap the containing ``Pipeline`` in a ``PipelineJob`` to
+    obtain executable ``FunctionJobNode`` / ``OperatorJobNode`` variants.
+    """
+
+
+class EmptyDataAccessError(Exception):
+    """Raised when a payload-access method is called on an ``EmptyData`` instance.
+
+    ``EmptyData`` carries no data payload. Any method that would access the
+    underlying columns (``as_dict``, ``as_table``, ``keys``, ``schema``,
+    ``arrow_schema``, ``identity_structure``) raises this exception instead of
+    returning empty or ``None`` results.
+
+    Attributes:
+        empty_data: The ``EmptyData`` instance on which the method was called.
+        method_name: The name of the method that was called.
+    """
+
+    def __init__(self, empty_data: object, method_name: str) -> None:
+        self.empty_data = empty_data
+        self.method_name = method_name
+        super().__init__(
+            f"Cannot call {method_name!r} on EmptyData — "
+            "this instance carries no data payload. "
+            "Check isinstance(data, EmptyData) before accessing the payload."
+        )
+
+
+class EmptyDataHashMissingError(Exception):
+    """Raised when ``content_hash()`` is called on an ``EmptyData`` that has no cached hash.
+
+    An ``EmptyData`` constructed without a ``cached_content_hash`` is in degraded
+    mode (old pipeline DB row lacking the hash column). Any code path that tries
+    to use the hash fails loudly here.
+
+    Attributes:
+        empty_data: The ``EmptyData`` instance on which ``content_hash()`` was called.
+    """
+
+    def __init__(self, empty_data: object) -> None:
+        self.empty_data = empty_data
+        super().__init__(
+            "content_hash() called on EmptyData with no cached_content_hash. "
+            "The pipeline DB row that produced this token is missing the stored "
+            "hash column (OUTPUT_DATA_HASH_COL or INPUT_DATA_HASH_COL). "
+            "Flow-through is unavailable for this row."
+        )
+
+
+class SchemaVersionError(Exception):
+    """Raised when an old schema version is detected at a database path.
+
+    Occurs when a table exists at the unversioned (v0) path but not at the
+    expected versioned path, and the node has not opted in to tolerating
+    the old schema via ``NodeConfig.ignore_schema``.
+
+    To suppress this error, set ``node.node_config = NodeConfig(ignore_schema=("v0",))``
+    and re-run. The node will recompute all results from scratch rather than
+    reading from the v0 cache.
+    """
+
+
+class EphemeralResultMissingError(Exception):
+    """Raised when a downstream pod has a cache miss for an ``EmptyData`` input.
+
+    Indicates that the upstream ephemeral result is gone AND the downstream pod
+    has not yet computed a result for the same input content hash. No recovery
+    is possible — the information has been lost.
+
+    Attributes:
+        tag: The tag associated with the missing input.
+        cached_content_hash: The cached content hash from the ``EmptyData``, or
+            ``None`` if the ``EmptyData`` itself lacked a hash.
+        node_identity_path: Identity path of the downstream node raising this error.
+    """
+
+    def __init__(
+        self,
+        tag: object,
+        cached_content_hash: object,
+        node_identity_path: tuple[str, ...],
+        message: str,
+    ) -> None:
+        self.tag = tag
+        self.cached_content_hash = cached_content_hash
+        self.node_identity_path = node_identity_path
+        super().__init__(
+            f"{message} "
+            f"node={node_identity_path!r} "
+            f"cached_content_hash={cached_content_hash!r}"
+        )

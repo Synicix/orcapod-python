@@ -35,7 +35,7 @@ class NoOpArrowDatabase:
     def add_record(
         self,
         record_path: tuple[str, ...],
-        record_id: str,
+        record_id: str | bytes,
         record: "pa.Table",
         skip_duplicates: bool = False,
         flush: bool = False,
@@ -55,7 +55,7 @@ class NoOpArrowDatabase:
     def get_record_by_id(
         self,
         record_path: tuple[str, ...],
-        record_id: str,
+        record_id: str | bytes,
         record_id_column: str | None = None,
         flush: bool = False,
     ) -> "pa.Table | None":
@@ -71,7 +71,7 @@ class NoOpArrowDatabase:
     def get_records_by_ids(
         self,
         record_path: tuple[str, ...],
-        record_ids: Collection[str],
+        record_ids: Collection[str | bytes],
         record_id_column: str | None = None,
         flush: bool = False,
     ) -> "pa.Table | None":
@@ -88,6 +88,18 @@ class NoOpArrowDatabase:
 
     def flush(self) -> None:
         pass
+
+    def table_exists(self, record_path: tuple[str, ...]) -> bool:
+        """Return ``False`` — no tables are ever persisted by this no-op implementation.
+
+        Args:
+            record_path: Path components identifying the table, relative to
+                ``self.base_path``.
+
+        Returns:
+            Always ``False``.
+        """
+        return False
 
     @property
     def base_path(self) -> tuple[str, ...]:

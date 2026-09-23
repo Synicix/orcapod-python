@@ -9,17 +9,17 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
-import networkx as nx
 import pyarrow as pa
 import pytest
 
 from orcapod.core.function_pod import FunctionPod
-from orcapod.core.nodes import FunctionNode, GraphNode, OperatorNode, SourceNode
+from orcapod.core.nodes import FunctionNode, OperatorNode, SourceNode
 from orcapod.core.operators import Join
 from orcapod.core.data_function import PythonDataFunction
 from orcapod.core.sources import ArrowTableSource
 from orcapod.databases import InMemoryArrowDatabase
-from orcapod.pipeline import Pipeline
+from orcapod.pipeline.job import PipelineJob
+from orcapod.pipeline.dag import OrcaDAG
 from orcapod.pipeline.graph import (
     GraphRenderer,
     StyleRuleSets,
@@ -63,24 +63,23 @@ def pipeline_db() -> InMemoryArrowDatabase:
 
 
 @pytest.fixture
-def compiled_pipeline(pipeline_db: InMemoryArrowDatabase) -> Pipeline:
-    """A compiled pipeline with source, operator, and function nodes."""
+def compiled_job(pipeline_db: InMemoryArrowDatabase) -> PipelineJob:
+    """A compiled job with source, operator, and function nodes."""
     src_a, src_b = _make_two_sources()
     pf = PythonDataFunction(_add_values, output_keys="total")
     pod = FunctionPod(data_function=pf)
 
-    pipeline = Pipeline(name="test_render", pipeline_database=pipeline_db)
-    with pipeline:
+    job = PipelineJob(name="test_render", store=pipeline_db)
+    with job:
         joined = Join()(src_a, src_b)
         pod(joined, label="adder")
 
-    return pipeline
+    return job
 
 
 @pytest.fixture
-def node_graph(compiled_pipeline: Pipeline) -> nx.DiGraph:
-    assert compiled_pipeline._node_graph is not None
-    return compiled_pipeline._node_graph
+def node_graph(compiled_job: PipelineJob) -> OrcaDAG:
+    return compiled_job.pipeline.dag
 
 
 # ---------------------------------------------------------------------------
@@ -89,14 +88,14 @@ def node_graph(compiled_pipeline: Pipeline) -> nx.DiGraph:
 
 
 class TestGraphRenderer:
-    def test_generate_dot_returns_dot_source(self, node_graph: nx.DiGraph) -> None:
+    def test_generate_dot_returns_dot_source(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         dot_text = renderer.generate_dot(node_graph)
 
         assert isinstance(dot_text, str)
         assert "digraph" in dot_text
 
-    def test_generate_dot_includes_all_nodes(self, node_graph: nx.DiGraph) -> None:
+    def test_generate_dot_includes_all_nodes(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         dot_text = renderer.generate_dot(node_graph)
 
@@ -104,7 +103,7 @@ class TestGraphRenderer:
             sanitized = renderer._sanitize_node_id(node)
             assert sanitized in dot_text
 
-    def test_generate_dot_includes_edges(self, node_graph: nx.DiGraph) -> None:
+    def test_generate_dot_includes_edges(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         dot_text = renderer.generate_dot(node_graph)
 
@@ -114,7 +113,7 @@ class TestGraphRenderer:
             assert source_id in dot_text
             assert target_id in dot_text
 
-    def test_generate_dot_with_label_lut(self, node_graph: nx.DiGraph) -> None:
+    def test_generate_dot_with_label_lut(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         first_node = next(iter(node_graph.nodes()))
         label_lut = {first_node: "Custom Label"}
@@ -123,7 +122,7 @@ class TestGraphRenderer:
         assert "Custom Label" in dot_text
 
     def test_generate_dot_with_custom_style_rules(
-        self, node_graph: nx.DiGraph
+        self, node_graph: OrcaDAG
     ) -> None:
         renderer = GraphRenderer()
         custom_rules = {
@@ -139,14 +138,14 @@ class TestGraphRenderer:
         assert "red" in dot_text
         assert "ellipse" in dot_text
 
-    def test_render_graph_raw_output(self, node_graph: nx.DiGraph) -> None:
+    def test_render_graph_raw_output(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         dot_text = renderer.render_graph(node_graph, raw_output=True, show=False)
 
         assert isinstance(dot_text, str)
         assert "digraph" in dot_text
 
-    def test_render_graph_with_dark_theme(self, node_graph: nx.DiGraph) -> None:
+    def test_render_graph_with_dark_theme(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         dot_text = renderer.render_graph(
             node_graph,
@@ -165,7 +164,7 @@ class TestGraphRenderer:
 
 
 class TestNodeAttributes:
-    def test_source_node_gets_source_style(self, node_graph: nx.DiGraph) -> None:
+    def test_source_node_gets_source_style(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         source_nodes = [n for n in node_graph.nodes() if isinstance(n, SourceNode)]
         assert len(source_nodes) > 0
@@ -175,7 +174,7 @@ class TestNodeAttributes:
         assert attrs["fillcolor"] == expected["fillcolor"]
         assert attrs["shape"] == expected["shape"]
 
-    def test_function_node_gets_function_style(self, node_graph: nx.DiGraph) -> None:
+    def test_function_node_gets_function_style(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         fn_nodes = [n for n in node_graph.nodes() if isinstance(n, FunctionNode)]
         assert len(fn_nodes) > 0
@@ -185,7 +184,7 @@ class TestNodeAttributes:
         assert attrs["fillcolor"] == expected["fillcolor"]
         assert attrs["shape"] == expected["shape"]
 
-    def test_operator_node_gets_operator_style(self, node_graph: nx.DiGraph) -> None:
+    def test_operator_node_gets_operator_style(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         op_nodes = [n for n in node_graph.nodes() if isinstance(n, OperatorNode)]
         assert len(op_nodes) > 0
@@ -195,7 +194,7 @@ class TestNodeAttributes:
         assert attrs["fillcolor"] == expected["fillcolor"]
         assert attrs["shape"] == expected["shape"]
 
-    def test_custom_rules_override_defaults(self, node_graph: nx.DiGraph) -> None:
+    def test_custom_rules_override_defaults(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         source_node = next(
             n for n in node_graph.nodes() if isinstance(n, SourceNode)
@@ -214,7 +213,7 @@ class TestNodeAttributes:
 
 class TestHtmlLabel:
     def test_label_contains_node_type_and_label(
-        self, node_graph: nx.DiGraph
+        self, node_graph: OrcaDAG
     ) -> None:
         renderer = GraphRenderer()
         for node in node_graph.nodes():
@@ -224,14 +223,14 @@ class TestHtmlLabel:
             assert node.node_type in html
             assert str(node.label) in html
 
-    def test_label_lut_overrides_default(self, node_graph: nx.DiGraph) -> None:
+    def test_label_lut_overrides_default(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         node = next(iter(node_graph.nodes()))
         label_lut = {node: "overridden"}
 
         assert renderer._get_node_label(node, label_lut) == "overridden"
 
-    def test_default_label_uses_node_label(self, node_graph: nx.DiGraph) -> None:
+    def test_default_label_uses_node_label(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         node = next(iter(node_graph.nodes()))
 
@@ -244,13 +243,13 @@ class TestHtmlLabel:
 
 
 class TestConvenienceFunctions:
-    def test_render_graph_function(self, node_graph: nx.DiGraph) -> None:
+    def test_render_graph_function(self, node_graph: OrcaDAG) -> None:
         dot_text = render_graph(node_graph, raw_output=True, show=False)
 
         assert isinstance(dot_text, str)
         assert "digraph" in dot_text
 
-    def test_render_graph_dark_theme_function(self, node_graph: nx.DiGraph) -> None:
+    def test_render_graph_dark_theme_function(self, node_graph: OrcaDAG) -> None:
         dot_text = render_graph_dark_theme(
             node_graph, raw_output=True, show=False
         )
@@ -295,46 +294,40 @@ class TestStyleRuleSets:
 
 class TestPipelineShowGraph:
     def test_show_graph_raises_before_compile(self, pipeline_db) -> None:
-        pipeline = Pipeline(name="uncompiled", pipeline_database=pipeline_db)
+        job = PipelineJob(name="uncompiled", store=pipeline_db)
 
-        with pytest.raises(RuntimeError, match="compiled"):
-            pipeline.show_graph(raw_output=True, show=False)
+        with pytest.raises(RuntimeError):
+            job.pipeline.show_graph(raw_output=True, show=False)
 
     def test_show_graph_returns_dot(
-        self, compiled_pipeline: Pipeline
+        self, compiled_job: PipelineJob
     ) -> None:
-        dot_text = compiled_pipeline.show_graph(raw_output=True, show=False)
+        dot_text = compiled_job.pipeline.show_graph(raw_output=True, show=False)
 
         assert isinstance(dot_text, str)
         assert "digraph" in dot_text
 
     def test_show_graph_with_label_lut(
-        self, compiled_pipeline: Pipeline
+        self, compiled_job: PipelineJob
     ) -> None:
-        assert compiled_pipeline._node_graph is not None
-        first_node = next(iter(compiled_pipeline._node_graph.nodes()))
+        first_node = next(iter(compiled_job.pipeline.dag.nodes()))
         label_lut = {first_node: "MyCustomLabel"}
 
-        dot_text = compiled_pipeline.show_graph(
+        dot_text = compiled_job.pipeline.show_graph(
             label_lut=label_lut, raw_output=True, show=False
         )
 
         assert "MyCustomLabel" in dot_text
 
     def test_show_graph_with_style_rules(
-        self, compiled_pipeline: Pipeline
+        self, compiled_job: PipelineJob
     ) -> None:
         custom = StyleRuleSets.create_custom_rules(source_bg="lime")
-        dot_text = compiled_pipeline.show_graph(
+        dot_text = compiled_job.pipeline.show_graph(
             style_rules=custom, raw_output=True, show=False
         )
 
         assert "lime" in dot_text
-
-
-# ---------------------------------------------------------------------------
-# Tests: style merging
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +338,7 @@ class TestPipelineShowGraph:
 class TestRenderGraphFullPath:
     """Exercise the graphviz rendering code paths (not just raw DOT output)."""
 
-    def test_render_no_show_no_output(self, node_graph: nx.DiGraph) -> None:
+    def test_render_no_show_no_output(self, node_graph: OrcaDAG) -> None:
         """render_graph with show=False exercises graphviz build without display."""
         renderer = GraphRenderer()
         result = renderer.render_graph(node_graph, show=False)
@@ -354,7 +347,7 @@ class TestRenderGraphFullPath:
         assert "digraph" in result
 
     def test_render_with_output_path(
-        self, node_graph: nx.DiGraph, tmp_path
+        self, node_graph: OrcaDAG, tmp_path
     ) -> None:
         output_file = str(tmp_path / "graph.png")
         renderer = GraphRenderer()
@@ -365,7 +358,7 @@ class TestRenderGraphFullPath:
         assert isinstance(result, str)
         assert os.path.exists(output_file)
 
-    def test_render_with_show_mocked(self, node_graph: nx.DiGraph) -> None:
+    def test_render_with_show_mocked(self, node_graph: OrcaDAG) -> None:
         """Exercise the show=True path with matplotlib mocked."""
         renderer = GraphRenderer()
         with (
@@ -381,7 +374,7 @@ class TestRenderGraphFullPath:
         assert "digraph" in result
 
     def test_render_with_label_lut_full_path(
-        self, node_graph: nx.DiGraph
+        self, node_graph: OrcaDAG
     ) -> None:
         first_node = next(iter(node_graph.nodes()))
         label_lut = {first_node: "FullPathLabel"}
@@ -393,7 +386,7 @@ class TestRenderGraphFullPath:
         assert isinstance(result, str)
 
     def test_render_with_style_rules_full_path(
-        self, node_graph: nx.DiGraph
+        self, node_graph: OrcaDAG
     ) -> None:
         custom = StyleRuleSets.create_custom_rules(source_bg="coral")
         renderer = GraphRenderer()
@@ -403,7 +396,7 @@ class TestRenderGraphFullPath:
 
         assert isinstance(result, str)
 
-    def test_render_with_style_overrides(self, node_graph: nx.DiGraph) -> None:
+    def test_render_with_style_overrides(self, node_graph: OrcaDAG) -> None:
         renderer = GraphRenderer()
         result = renderer.render_graph(
             node_graph, show=False, dpi=72, rankdir="LR"
@@ -413,14 +406,14 @@ class TestRenderGraphFullPath:
 
 
 class TestConvenienceFunctionsFullPath:
-    def test_render_graph_no_show(self, node_graph: nx.DiGraph) -> None:
+    def test_render_graph_no_show(self, node_graph: OrcaDAG) -> None:
         result = render_graph(node_graph, show=False)
 
         assert isinstance(result, str)
         assert "digraph" in result
 
     def test_render_graph_dark_theme_no_show(
-        self, node_graph: nx.DiGraph
+        self, node_graph: OrcaDAG
     ) -> None:
         result = render_graph_dark_theme(node_graph, show=False)
 
@@ -429,14 +422,14 @@ class TestConvenienceFunctionsFullPath:
 
 
 class TestPipelineShowGraphFullPath:
-    def test_show_graph_no_show(self, compiled_pipeline: Pipeline) -> None:
-        result = compiled_pipeline.show_graph(show=False)
+    def test_show_graph_no_show(self, compiled_job: PipelineJob) -> None:
+        result = compiled_job.pipeline.show_graph(show=False)
 
         assert isinstance(result, str)
         assert "digraph" in result
 
     def test_show_graph_with_show_mocked(
-        self, compiled_pipeline: Pipeline
+        self, compiled_job: PipelineJob
     ) -> None:
         with (
             patch("matplotlib.pyplot.figure"),
@@ -445,7 +438,7 @@ class TestPipelineShowGraphFullPath:
             patch("matplotlib.pyplot.tight_layout"),
             patch("matplotlib.pyplot.show"),
         ):
-            result = compiled_pipeline.show_graph(show=True)
+            result = compiled_job.pipeline.show_graph(show=True)
 
         assert isinstance(result, str)
         assert "digraph" in result

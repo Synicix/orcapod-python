@@ -3,66 +3,92 @@ OrcaPod hashing package.
 
 Public API
 ----------
-  BaseSemanticHasher           -- content-based recursive object hasher (concrete)
-  SemanticHasherProtocol       -- protocol for semantic hashers
-  TypeHandlerRegistry          -- registry mapping types to TypeHandlerProtocol instances
-  get_default_semantic_hasher  -- global default SemanticHasherProtocol factory
-  get_default_type_handler_registry -- global default TypeHandlerRegistry factory
-  ContentIdentifiableMixin     -- convenience mixin for content-identifiable objects
+  SemanticAwarePythonHasher            -- content-based recursive object hasher
+  SemanticHasherProtocol               -- protocol for semantic hashers
+  PythonTypeHandlerRegistry            -- registry mapping types to PythonTypeHandlerProtocol instances
+  get_default_semantic_hasher          -- global default SemanticHasherProtocol factory
+  get_default_python_type_handler_registry -- global default registry factory
+  ContentIdentifiableMixin             -- convenience mixin for content-identifiable objects
 
-Built-in handlers (importable for custom registry setup):
-  PathContentHandler
+Built-in hashers (importable for custom registry setup):
   UUIDHandler
   BytesHandler
   FunctionHandler
   TypeObjectHandler
-  register_builtin_handlers
+  FileHandler
+  DirectoryHandler                     -- built-in handler for orcapod.Directory
+  register_builtin_python_type_handlers
 
-Legacy names (kept for backward compatibility):
-  HashableMixin             -- legacy mixin from legacy_core (deprecated)
+File hashing:
+  FileHasher                           -- content hasher for individual files
+  FileHashKey                          -- frozen dataclass cache key (path, mtime_ns, size)
+  CachedFileHasher                     -- caching decorator around FileContentHasherProtocol
+  InMemoryHashCacher                   -- dict-backed cacher for testing
+  SqliteHashCacher                     -- SQLite-backed persistent cacher
+  CachePopulationStats                 -- stats returned by populate_hash_cache()
+  populate_hash_cache                  -- pre-populate the SQLite hash cache for large files
 
 Utility:
+  CacherProtocol                       -- generic get/put caching protocol [K, V]
   FileContentHasherProtocol
   StringCacherProtocol
   FunctionInfoExtractorProtocol
   ArrowHasherProtocol
+  BasicDirectoryHasher                 -- recursive Merkle tree directory hasher
+  DirectoryHasherProtocol              -- protocol for directory hashers
 """
 
-# ---------------------------------------------------------------------------
-# New API -- SemanticHasherProtocol, registry, mixin
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Default hasher factories
-# ---------------------------------------------------------------------------
 from orcapod.hashing.defaults import (
     get_default_arrow_hasher,
+    get_default_python_type_handler_registry,
     get_default_semantic_hasher,
-    get_default_type_handler_registry,
 )
+from orcapod.hashing.file_hashers import CachedFileHasher, FileHasher, FileHashKey
+from orcapod.hashing.cache_population import (
+    CachePopulationStats,
+    FileOutcome,
+    ProgressCallback,
+    populate_hash_cache,
+)
+from orcapod.hashing.hash_cachers import InMemoryHashCacher, SqliteHashCacher
 
-# ---------------------------------------------------------------------------
-# File hashing utilities
-# ---------------------------------------------------------------------------
-from orcapod.hashing.file_hashers import BasicFileHasher, CachedFileHasher
+try:
+    from orcapod.hashing.postgres_hash_cacher import PostgresHashCacher
+except ImportError:  # pragma: no cover
+    PostgresHashCacher = None  # type: ignore[assignment,misc]
+
+from orcapod.hashing.directory_hashers import BasicDirectoryHasher
 from orcapod.hashing.hash_utils import hash_file
 from orcapod.hashing.semantic_hashing.builtin_handlers import (
     BytesHandler,
+    DirectoryHandler,
+    FileHandler,
     FunctionHandler,
-    PathContentHandler,
     TypeObjectHandler,
     UUIDHandler,
-    register_builtin_handlers,
+    register_builtin_python_type_handlers,
 )
 from orcapod.hashing.semantic_hashing.content_identifiable_mixin import (
     ContentIdentifiableMixin,
 )
+from orcapod.hashing.semantic_hashing.semantic_hasher import SemanticAwarePythonHasher
+from orcapod.hashing.semantic_hashing.type_handler_registry import (
+    BuiltinPythonTypeHandlerRegistry,
+    PythonTypeHandlerRegistry,
+)
+from orcapod.protocols.hashing_protocols import (
+    ArrowHasherProtocol,
+    CacherProtocol,
+    ContentIdentifiableProtocol,
+    DirectoryHasherProtocol,
+    FileContentHasherProtocol,
+    FunctionInfoExtractorProtocol,
+    PythonTypeHandlerProtocol,
+    SemanticHasherProtocol,
+    SemanticTypeHasherProtocol,
+    StringCacherProtocol,
+)
 
-# ---------------------------------------------------------------------------
-# Legacy API (deprecated -- kept for backward compatibility)
-# These imports are guarded because legacy_core.py has pre-existing import
-# issues (e.g. references to removed types) that should not block the new API.
-# ---------------------------------------------------------------------------
 try:
     from orcapod.hashing.legacy_core import (
         HashableMixin,
@@ -85,60 +111,43 @@ except ImportError:
     hash_to_hex = None  # type: ignore[assignment]
     hash_to_int = None  # type: ignore[assignment]
     hash_to_uuid = None  # type: ignore[assignment]
-from orcapod.hashing.semantic_hashing.semantic_hasher import BaseSemanticHasher
-from orcapod.hashing.semantic_hashing.type_handler_registry import (
-    BuiltinTypeHandlerRegistry,
-    TypeHandlerRegistry,
-)
-
-# ---------------------------------------------------------------------------
-# Protocols (re-exported for convenience)
-# ---------------------------------------------------------------------------
-from orcapod.protocols.hashing_protocols import (
-    ArrowHasherProtocol,
-    ContentIdentifiableProtocol,
-    FileContentHasherProtocol,
-    FunctionInfoExtractorProtocol,
-    SemanticHasherProtocol,
-    SemanticTypeHasherProtocol,
-    StringCacherProtocol,
-    TypeHandlerProtocol,
-)
-
-# ---------------------------------------------------------------------------
-# __all__ -- defines the public surface of this package
-# ---------------------------------------------------------------------------
 
 __all__ = [
-    # ---- New API: concrete implementation ----
-    "BaseSemanticHasher",
-    "TypeHandlerRegistry",
-    "BuiltinTypeHandlerRegistry",
-    "get_default_type_handler_registry",
+    "SemanticAwarePythonHasher",
+    "PythonTypeHandlerRegistry",
+    "BuiltinPythonTypeHandlerRegistry",
+    "get_default_python_type_handler_registry",
     "get_default_semantic_hasher",
     "ContentIdentifiableMixin",
-    # Built-in handlers
-    "PathContentHandler",
     "UUIDHandler",
     "BytesHandler",
     "FunctionHandler",
     "TypeObjectHandler",
-    "register_builtin_handlers",
-    # ---- Protocols ----
+    "FileHandler",
+    "DirectoryHandler",
+    "register_builtin_python_type_handlers",
     "SemanticHasherProtocol",
     "ContentIdentifiableProtocol",
-    "TypeHandlerProtocol",
+    "PythonTypeHandlerProtocol",
     "FileContentHasherProtocol",
     "ArrowHasherProtocol",
+    "CacherProtocol",
     "StringCacherProtocol",
     "FunctionInfoExtractorProtocol",
     "SemanticTypeHasherProtocol",
-    # ---- File hashing ----
-    "BasicFileHasher",
+    "FileHasher",
+    "FileHashKey",
     "CachedFileHasher",
+    "InMemoryHashCacher",
+    "SqliteHashCacher",
+    "PostgresHashCacher",
+    "CachePopulationStats",
+    "FileOutcome",
+    "ProgressCallback",
+    "populate_hash_cache",
+    "BasicDirectoryHasher",
+    "DirectoryHasherProtocol",
     "hash_file",
-    # ---- Legacy / backward-compatible ----
-    # TODO: remove legacy section
     "get_default_arrow_hasher",
     "HashableMixin",
     "hash_to_hex",

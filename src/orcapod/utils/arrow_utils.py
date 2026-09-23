@@ -1,18 +1,39 @@
 from __future__ import annotations
 
+import uuid
 from collections import defaultdict
-from collections.abc import Mapping, Collection
-from typing import Any
+from collections.abc import Mapping, Collection, Sequence
+from typing import Any, TYPE_CHECKING
 
-
-from typing import TYPE_CHECKING
-from orcapod.utils.lazy_module import LazyModule
+from orcapod.hashing.hash_utils import combine_hashes
 from orcapod.system_constants import constants
+from orcapod.types import ColumnConfig
+from orcapod.utils.lazy_module import LazyModule
 
 if TYPE_CHECKING:
     import pyarrow as pa
+    from orcapod.protocols.semantic_types_protocols import TypeConverterProtocol
 else:
     pa = LazyModule("pyarrow")
+
+
+def make_empty_table(python_schema: "Mapping[str, Any]", type_converter: "TypeConverterProtocol") -> "pa.Table":
+    """Return a zero-row PyArrow table whose field nullability matches ``python_schema``.
+
+    Uses ``python_schema_to_arrow_schema`` so that plain types (``str``, ``int``, …)
+    produce ``nullable=False`` fields and Optional types (``str | None``) produce
+    ``nullable=True`` fields. This preserves the bidirectional round-trip through
+    ``ArrowTableStream.output_schema()``.
+
+    Args:
+        python_schema: Mapping of field name to Python type annotation.
+        type_converter: A ``UniversalTypeConverter`` instance.
+
+    Returns:
+        A zero-row ``pa.Table`` with the correct Arrow schema.
+    """
+    arrow_schema = type_converter.python_schema_to_arrow_schema(python_schema)
+    return pa.Table.from_batches([], schema=arrow_schema)
 
 
 def schema_select(
@@ -92,9 +113,12 @@ def normalize_to_large_types(arrow_type: "pa.DataType") -> "pa.DataType":
     if pa.types.is_null(arrow_type):
         # TODO: make this configurable
         return pa.large_string()
-    if pa.types.is_string(arrow_type):
+    if pa.types.is_string(arrow_type) or pa.types.is_string_view(arrow_type):
+        # string_view has no comparison/sort kernels in PyArrow (>=23, <=24), so
+        # normalizing it to large_string is required for filtering, not just for
+        # consistency. See DESIGN_ISSUES D8 / ENG-601.
         return pa.large_string()
-    elif pa.types.is_binary(arrow_type):
+    elif pa.types.is_binary(arrow_type) or pa.types.is_binary_view(arrow_type):
         return pa.large_binary()
     elif pa.types.is_list(arrow_type):
         # Regular list -> large_list with normalized element type
@@ -239,6 +263,145 @@ def normalize_table_to_large_types(table: "pa.Table") -> "pa.Table":
     # Use cast() for safety - should be zero-copy for large variant conversions
     # but handles Arrow's internal type validation and any edge cases properly
     return table.cast(normalized_schema)
+
+
+def normalize_view_types(arrow_type: "pa.DataType") -> "pa.DataType":
+    """Recursively convert Arrow *view* types to their large variants.
+
+    Maps ``string_view`` -> ``large_string`` and ``binary_view`` ->
+    ``large_binary``, recursing into nested types; all other types are returned
+    unchanged. PyArrow (>=23, <=24) has no comparison/sort kernels for view
+    types, so they must be converted before any grouping, filtering, or storage
+    or those operations raise ``ArrowNotImplementedError`` (ENG-601). Unlike
+    ``normalize_to_large_types`` this leaves ``string`` / ``binary`` / ``list``
+    as-is.
+    """
+    if pa.types.is_string_view(arrow_type):
+        return pa.large_string()
+    if pa.types.is_binary_view(arrow_type):
+        return pa.large_binary()
+    # For nested types, preserve the child fields' name/nullability/metadata
+    # (and keys_sorted for maps) and only swap out the view type underneath.
+    if pa.types.is_list(arrow_type):
+        vf = arrow_type.value_field
+        return pa.list_(vf.with_type(normalize_view_types(vf.type)))
+    if pa.types.is_large_list(arrow_type):
+        vf = arrow_type.value_field
+        return pa.large_list(vf.with_type(normalize_view_types(vf.type)))
+    if pa.types.is_fixed_size_list(arrow_type):
+        vf = arrow_type.value_field
+        return pa.list_(
+            vf.with_type(normalize_view_types(vf.type)), arrow_type.list_size
+        )
+    if pa.types.is_struct(arrow_type):
+        return pa.struct(
+            [f.with_type(normalize_view_types(f.type)) for f in arrow_type]
+        )
+    if pa.types.is_map(arrow_type):
+        kf, itf = arrow_type.key_field, arrow_type.item_field
+        return pa.map_(
+            kf.with_type(normalize_view_types(kf.type)),
+            itf.with_type(normalize_view_types(itf.type)),
+            keys_sorted=arrow_type.keys_sorted,
+        )
+    return arrow_type
+
+
+def normalize_extension_columns(table: "pa.Table") -> "pa.Table":
+    """Return a copy of ``table`` with all extension-typed columns converted to
+    their IPC/Parquet storage representation.
+
+    For each top-level column whose type is a ``pa.ExtensionType``, the column
+    data is replaced with the underlying storage array (via
+    ``ExtensionArray.storage`` — no Python-level materialization) and the field
+    gains ``ARROW:extension:name`` and ``ARROW:extension:metadata`` keys in its
+    metadata, exactly matching the on-disk Arrow IPC/Parquet format.
+
+    Non-extension columns are returned unchanged.  Schema-level metadata and
+    existing per-field metadata are preserved; the two ``ARROW:extension:*``
+    keys are merged in (or added) without touching any other metadata already
+    on the field.
+
+    This is a fast path: for tables with no extension columns the original
+    table object is returned immediately.  For tables that do have extension
+    columns a new table is constructed; chunking is preserved and the column
+    data itself is not copied — each chunk's ``ExtensionArray.storage``
+    property returns a zero-copy view of the underlying buffers.
+
+    Note: only **top-level** extension columns are handled.  Extension types
+    nested inside struct fields or list element types are not supported by the
+    orcapod type system (see ET1 in DESIGN_ISSUES.md) and are left unchanged.
+
+    Args:
+        table: Input Arrow table, may contain extension-typed columns.
+
+    Returns:
+        A ``pa.Table`` where every top-level extension-typed column has been
+        replaced by its storage-typed equivalent with extension identity
+        preserved in field metadata.
+    """
+    if not any(isinstance(field.type, pa.ExtensionType) for field in table.schema):
+        return table
+
+    new_columns: list[pa.ChunkedArray] = []
+    new_fields: list[pa.Field] = []
+    for i, field in enumerate(table.schema):
+        if isinstance(field.type, pa.ExtensionType):
+            ext_type = field.type
+            # Preserve chunking: convert each ExtensionArray chunk to its
+            # .storage chunk (zero-copy view of the underlying buffers) and
+            # rebuild a ChunkedArray.  Calling combine_chunks() first would
+            # allocate new buffers for multi-chunk columns, defeating the
+            # zero-copy guarantee.
+            col = table.column(i)
+            storage_arr = pa.chunked_array(
+                [chunk.storage for chunk in col.chunks],
+                type=ext_type.storage_type,
+            )
+            serialized = ext_type.__arrow_ext_serialize__()
+            # Merge extension identity into existing field metadata (if any)
+            # so that non-extension keys already on the field are preserved.
+            existing_meta = dict(field.metadata) if field.metadata else {}
+            existing_meta[b"ARROW:extension:name"] = (
+                ext_type.extension_name.encode("utf-8")
+            )
+            existing_meta[b"ARROW:extension:metadata"] = serialized
+            new_fields.append(pa.field(
+                field.name,
+                ext_type.storage_type,
+                nullable=field.nullable,
+                metadata=existing_meta,
+            ))
+            new_columns.append(storage_arr)
+        else:
+            new_columns.append(table.column(i))
+            new_fields.append(field)
+
+    return pa.table(
+        new_columns,
+        schema=pa.schema(new_fields, metadata=table.schema.metadata),
+    )
+
+
+def normalize_table_view_types(table: "pa.Table") -> "pa.Table":
+    """Cast a table's view-typed columns to their large variants.
+
+    Returns the table unchanged if it has no view types. PyArrow lacks
+    comparison/sort kernels for ``string_view`` / ``binary_view``, so a table
+    carrying them breaks group_by, filter, and Delta predicate pushdown until
+    converted (ENG-601).
+    """
+    new_types = [normalize_view_types(f.type) for f in table.schema]
+    if all(nt == f.type for nt, f in zip(new_types, table.schema)):
+        return table
+    new_schema = pa.schema(
+        [
+            pa.field(f.name, nt, nullable=f.nullable, metadata=f.metadata)
+            for f, nt in zip(table.schema, new_types)
+        ],
+        metadata=table.schema.metadata,
+    )
+    return table.cast(new_schema)
 
 
 def pylist_to_pydict(pylist: list[dict]) -> dict:
@@ -937,11 +1100,36 @@ def get_system_columns(table: "pa.Table") -> "pa.Table":
     )
 
 
+def system_tag_column_names(schema_hash: str) -> tuple[str, str]:
+    """Return the (source_id_col_name, record_id_col_name) system-tag column names.
+
+    These are the two column names that ``add_system_tag_columns`` adds to every
+    source table, and that ``ArrowTableStream`` exposes via ``keys(system_tags=True)``
+    and ``output_schema(system_tags=True)``.
+
+    Args:
+        schema_hash: Hex schema hash produced by ``compute_schema_hash()``.
+
+    Returns:
+        Tuple of ``(source_id_column_name, record_id_column_name)``.
+        Both start with ``constants.SYSTEM_TAG_PREFIX``. The source_id column
+        has ``large_string`` type; the record_id column has ``binary(16)``
+        (fixed-size 16-byte binary) type in the Arrow table.
+    """
+    source_id_col = (
+        f"{constants.SYSTEM_TAG_SOURCE_ID_PREFIX}{constants.BLOCK_SEPARATOR}{schema_hash}"
+    )
+    record_id_col = (
+        f"{constants.SYSTEM_TAG_RECORD_ID_PREFIX}{constants.BLOCK_SEPARATOR}{schema_hash}"
+    )
+    return source_id_col, record_id_col
+
+
 def add_system_tag_columns(
     table: "pa.Table",
     schema_hash: str,
     source_ids: str | Collection[str],
-    record_ids: Collection[str],
+    record_ids: Collection[bytes],
 ) -> "pa.Table":
     """Add paired source_id and record_id system tag columns to an Arrow table."""
     if not table.column_names:
@@ -961,11 +1149,10 @@ def add_system_tag_columns(
     if len(record_ids) != table.num_rows:
         raise ValueError("Length of record_ids must match number of rows in the table.")
 
-    source_id_col_name = f"{constants.SYSTEM_TAG_SOURCE_ID_PREFIX}{constants.BLOCK_SEPARATOR}{schema_hash}"
-    record_id_col_name = f"{constants.SYSTEM_TAG_RECORD_ID_PREFIX}{constants.BLOCK_SEPARATOR}{schema_hash}"
+    source_id_col_name, record_id_col_name = system_tag_column_names(schema_hash)
 
     source_id_array = pa.array(source_ids, type=pa.large_string())
-    record_id_array = pa.array(record_ids, type=pa.large_string())
+    record_id_array = pa.array(record_ids, type=pa.binary(16))
 
     # System tag columns are always computed, never null — declare nullable=False
     # explicitly so the schema intent is not lost in Polars round-trips.
@@ -973,7 +1160,7 @@ def add_system_tag_columns(
         pa.field(source_id_col_name, pa.large_string(), nullable=False), source_id_array
     )
     table = table.append_column(
-        pa.field(record_id_col_name, pa.large_string(), nullable=False), record_id_array
+        pa.field(record_id_col_name, pa.binary(16), nullable=False), record_id_array
     )
     return table
 
@@ -990,6 +1177,121 @@ def append_to_system_tags(table: "pa.Table", value: str) -> "pa.Table":
         for c in table.column_names
     }
     return table.rename_columns(column_name_map)
+
+
+# Fixed namespace for aggregated record IDs produced by many->one operators.
+# Mirrors _SOURCE_RECORD_ID_NAMESPACE in core/sources/stream_builder.py.
+# Computed value: uuid.UUID('96411bfc-d3ba-5395-ba6f-5bb5726f18ad')
+_AGGREGATED_RECORD_ID_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL,
+    "https://orcapod.org/namespaces/aggregated-record-id",
+)
+
+
+def fold_system_tag_values(column_name: str, values: Sequence[Any]) -> str | bytes:
+    """Fold a group's system-tag values into one scalar of the same type.
+
+    Many->one operators must emit scalar system tags, because
+    ``_build_record_id_preimage`` (``core/nodes/function_node.py``) hashes
+    those columns directly to derive a record's identity.  Each column folds
+    independently over its own ordered member values.
+
+    Both digests are SHA-based and therefore stable across processes.  Never
+    substitute ``hash()`` or a set-based construction: orcapod uses the result
+    as a cache key, so a per-process digest would miss the cache on every new
+    driver run while looking correct in a single-process test.
+
+    Member order is significant -- it matches the order of the list-valued
+    data columns the folded tag accompanies.
+
+    Args:
+        column_name: The system-tag column name, used to select the fold.
+            Names starting with ``constants.SYSTEM_TAG_RECORD_ID_PREFIX`` fold
+            to ``binary(16)``; everything else folds to a hex string.
+        values: The group's member values, in emission order.
+
+    Returns:
+        16 raw bytes for a record_id column, a 64-character hex string
+        otherwise.
+    """
+    if column_name.startswith(constants.SYSTEM_TAG_RECORD_ID_PREFIX):
+        name = constants.BLOCK_SEPARATOR.join(
+            "" if v is None else v.hex() for v in values
+        )
+        return uuid.uuid5(_AGGREGATED_RECORD_ID_NAMESPACE, name).bytes
+    return combine_hashes(
+        *["" if v is None else str(v) for v in values], order=False
+    )
+
+
+def build_aggregated_table(
+    rows: "Sequence[Mapping[str, Any]]",
+    input_schema: "pa.Schema",
+    member_columns: "Collection[str]",
+    type_converter: Any,
+) -> "pa.Table":
+    """Build a many->one operator's output table, list-wrapping member columns.
+
+    Columns named in ``member_columns`` become list-valued, one element per
+    group member; every other column keeps its input field unchanged (that is
+    how scalar group keys and folded system tags pass through).
+
+    Logical element types are preserved. Arrow cannot embed an extension type
+    inside a list value field, so ``pa.list_(extension_type)`` raises
+    ``ArrowNotImplementedError`` (see ``DESIGN_ISSUES`` ET1/ET2). For such a
+    column the list is built over the element's *storage* type and then wrapped
+    in the outer ``list[<element>]`` extension type supplied by
+    ``ListLogicalType``. A pod annotated ``-> Path`` therefore groups into
+    ``list[orcapod.path]`` rather than losing the type or failing.
+
+    Args:
+        rows: One mapping per output row, values already aggregated into lists
+            for every member column.
+        input_schema: Schema of the operator's input table, used to derive
+            element types and to pass non-member fields through unchanged.
+        member_columns: Names of the columns to list-wrap.
+        type_converter: The stream's type converter, used to resolve an
+            extension type's Python element type and the matching outer list
+            extension type.
+
+    Returns:
+        The aggregated ``pa.Table``.
+    """
+    member_columns = set(member_columns)
+    fields: list[pa.Field] = []
+    # Extension columns are built as plain storage lists, then re-wrapped.
+    extension_overrides: dict[str, Any] = {}
+
+    for field in input_schema:
+        if field.name not in member_columns:
+            fields.append(field)
+            continue
+        if isinstance(field.type, pa.ExtensionType):
+            element_python_type = type_converter.arrow_type_to_python_type(field.type)
+            list_type = type_converter.python_type_to_arrow_type(
+                list[element_python_type]
+            )
+            extension_overrides[field.name] = list_type
+            fields.append(
+                pa.field(field.name, list_type.storage_type, nullable=False)
+            )
+        else:
+            fields.append(pa.field(field.name, pa.list_(field.type), nullable=False))
+
+    table = pa.Table.from_pylist(list(rows), schema=pa.schema(fields))
+
+    for name, list_type in extension_overrides.items():
+        index = table.schema.get_field_index(name)
+        storage = table.column(name)
+        wrapped = pa.chunked_array(
+            [pa.ExtensionArray.from_storage(list_type, chunk) for chunk in storage.chunks],
+            type=list_type,
+        )
+        table = table.set_column(
+            index, pa.field(name, list_type, nullable=False), wrapped
+        )
+
+    return table
 
 
 def _parse_system_tag_column(
@@ -1184,6 +1486,84 @@ def add_source_info(
         )
 
     return table
+
+
+def apply_column_config(
+    table: "pa.Table",
+    column_config: ColumnConfig,
+    tag_keys: tuple[str, ...],
+) -> "pa.Table":
+    """Apply ``ColumnConfig`` column filtering and optional tag-sort to a table.
+
+    Data columns are derived automatically from the table's column names by
+    excluding the known tag columns and all system-managed column groups
+    (system tags, source-info, context, meta).  This means callers only need to
+    supply ``tag_keys``; there is no need to thread ``data_keys`` through the
+    call site.
+
+    Args:
+        table: A fully-materialized PyArrow table (all columns present).
+        column_config: Resolved column configuration.
+        tag_keys: Names of the regular (non-system) tag columns.
+
+    Returns:
+        A new table with the appropriate columns dropped and optionally
+        sorted by tag columns.
+    """
+    tag_key_set = set(tag_keys)
+    # Derive data column names: anything that is not a tag, not a system-prefix
+    # column, and not the context key.
+    data_keys = tuple(
+        c
+        for c in table.column_names
+        if c not in tag_key_set
+        and not c.startswith(constants.SYSTEM_TAG_PREFIX)
+        and not c.startswith(constants.META_PREFIX)
+        and not c.startswith(constants.SOURCE_PREFIX)
+        and c != constants.CONTEXT_KEY
+    )
+    drop_columns = []
+    if not column_config.system_tags:
+        drop_columns.extend(
+            c for c in table.column_names
+            if c.startswith(constants.SYSTEM_TAG_PREFIX)
+        )
+    if not column_config.source:
+        drop_columns.extend(
+            f"{constants.SOURCE_PREFIX}{c}" for c in data_keys
+        )
+    if not column_config.context:
+        drop_columns.append(constants.CONTEXT_KEY)
+    if not column_config.meta:
+        drop_columns.extend(
+            c for c in table.column_names if c.startswith(constants.META_PREFIX)
+        )
+    elif not isinstance(column_config.meta, bool):
+        # Normalize: prepend META_PREFIX to any user-supplied prefix that doesn't
+        # already carry it.  This matches ColumnConfig's documented behaviour that
+        # the '__' prefix is added automatically when not present.
+        normalized_meta_prefixes = [
+            p if p.startswith(constants.META_PREFIX) else f"{constants.META_PREFIX}{p}"
+            for p in column_config.meta
+        ]
+        drop_columns.extend(
+            c for c in table.column_names
+            if c.startswith(constants.META_PREFIX)
+            and not any(c.startswith(p) for p in normalized_meta_prefixes)
+        )
+    output_table = table.drop(
+        [c for c in drop_columns if c in table.column_names]
+    )
+    if column_config.sort_by_tags:
+        import polars as pl
+        output_table_schema = output_table.schema
+        output_table = (
+            pl.DataFrame(output_table)
+            .sort(by=list(tag_keys), descending=False)
+            .to_arrow()
+        )
+        output_table = restore_schema_nullability(output_table, output_table_schema)
+    return output_table
 
 
 if __name__ == "__main__":

@@ -1,296 +1,83 @@
-import hashlib
-import json
-from collections.abc import Callable
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 from starfix import ArrowDigester
 
-from orcapod.hashing import arrow_serialization
+from orcapod.hashing.schema_cleaner import clean_schema_for_hashing, has_extension_metadata
 from orcapod.hashing.visitors import SemanticHashingVisitor
-from orcapod.semantic_types import SemanticTypeRegistry
+from orcapod.utils.arrow_utils import normalize_extension_columns
 from orcapod.types import ContentHash
-from orcapod.utils import arrow_utils
 
-SERIALIZATION_METHOD_LUT: dict[str, Callable[[pa.Table], bytes]] = {
-    "logical": arrow_serialization.serialize_table_logical,
-}
-
-
-def json_pyarrow_table_serialization(table: pa.Table) -> str:
-    """
-    Serialize a PyArrow table to a stable JSON string by converting to dictionary of lists.
-
-    Args:
-        table: PyArrow table to serialize
-
-    Returns:
-        JSON string representation with sorted keys and no whitespace
-    """
-    # Convert table to dictionary of lists using to_pylist()
-    data_dict = {}
-
-    for column_name in table.column_names:
-        # Convert Arrow column to Python list, which visits all elements
-        data_dict[column_name] = table.column(column_name).to_pylist()
-
-    # Serialize to JSON with sorted keys and no whitespace
-    return json.dumps(
-        data_dict,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-
-
-class SemanticArrowHasher:
-    """
-    Stable hasher for Arrow tables with semantic type support.
-
-    This hasher:
-    1. Uses visitor pattern to recursively process nested data structures
-    2. Replaces semantic types with their hash strings using registered converters
-    3. Sorts columns by name for deterministic ordering
-    4. Uses Arrow serialization for stable binary representation
-    5. Computes final hash of the processed table
-    """
-
-    def __init__(
-        self,
-        semantic_registry: SemanticTypeRegistry,
-        hasher_id: str | None = None,
-        hash_algorithm: str = "sha256",
-        chunk_size: int = 8192,
-        handle_missing: str = "error",
-        serialization_method: str = "logical",
-        # TODO: consider passing options for serialization method
-    ):
-        """
-        Initialize SemanticArrowHasher.
-
-        Args:
-            semantic_registry: Registry containing semantic type converters with hashing
-            hash_algorithm: Hash algorithm to use for final table hash
-            chunk_size: Size of chunks to read files in bytes (legacy, may be removed)
-            hasher_id: Unique identifier for this hasher instance
-            handle_missing: How to handle missing files ('error', 'skip', 'null_hash')
-            serialization_method: Method for serializing Arrow table
-        """
-        if hasher_id is None:
-            hasher_id = f"semantic_arrow_hasher:{hash_algorithm}:{serialization_method}"
-
-        self._hasher_id = hasher_id
-        self.semantic_registry = semantic_registry
-        self.chunk_size = chunk_size
-        self.handle_missing = handle_missing
-        self.hash_algorithm = hash_algorithm
-
-        if serialization_method not in SERIALIZATION_METHOD_LUT:
-            raise ValueError(
-                f"Invalid serialization method '{serialization_method}'. "
-                f"Supported methods: {list(SERIALIZATION_METHOD_LUT.keys())}"
-            )
-        self.serialization_method = serialization_method
-
-    @property
-    def hasher_id(self) -> str:
-        return self._hasher_id
-
-    def _process_table_columns(self, table: pa.Table | pa.RecordBatch) -> pa.Table:
-        """
-        Process table columns using visitor pattern to handle nested semantic types.
-
-        This replaces the old column-by-column processing with a visitor-based approach
-        that can handle semantic types nested inside complex data structures.
-        """
-        # TODO: Process in batchwise/chunk-wise fashion for memory efficiency
-        # Currently using to_pylist() for simplicity but this loads entire table into memory
-
-        new_columns = []
-        new_fields = []
-
-        # Import here to avoid circular dependencies
-        for i, field in enumerate(table.schema):
-            # Convert column to struct dicts for processing
-            column_data = table.column(i).to_pylist()
-
-            # TODO: verify the functioning of the visitor pattern
-            # Create fresh visitor for each column (stateless approach)
-            visitor = SemanticHashingVisitor(self.semantic_registry)
-
-            try:
-                # Use visitor to transform both type and data
-                new_type = None
-                processed_data = []
-                for c in column_data:
-                    processed_type, processed_value = visitor.visit(field.type, c)
-                    if new_type is None:
-                        new_type = processed_type
-                    processed_data.append(processed_value)
-
-                # Create new Arrow column from processed data
-                assert new_type is not None, "Failed to infer new column type"
-                # TODO: revisit this logic
-                new_column = pa.array(processed_data, type=new_type)
-                new_field = pa.field(field.name, new_type)
-
-                new_columns.append(new_column)
-                new_fields.append(new_field)
-
-            except Exception as e:
-                # Add context about which column failed
-                raise RuntimeError(
-                    f"Failed to process column '{field.name}': {str(e)}"
-                ) from e
-
-        # Return new table with processed columns
-        return pa.table(new_columns, schema=pa.schema(new_fields))
-
-    def _sort_table_columns(self, table: pa.Table) -> pa.Table:
-        """Sort table columns by field name for deterministic ordering."""
-        # Get sorted column names
-        sorted_column_names = sorted(table.column_names)
-
-        # Use select to reorder columns - much cleaner!
-        return table.select(sorted_column_names)
-
-    def serialize_arrow_table(self, table: pa.Table) -> bytes:
-        """
-        Serialize Arrow table using the configured serialization method.
-
-        Args:
-            table: Arrow table to serialize
-
-        Returns:
-            Serialized bytes of the table
-        """
-        serialization_method_function = SERIALIZATION_METHOD_LUT[
-            self.serialization_method
-        ]
-        return serialization_method_function(table)
-
-    def hash_table(self, table: pa.Table | pa.RecordBatch) -> ContentHash:
-        """
-        Compute stable hash of Arrow table with semantic type processing.
-
-        Args:
-            table: Arrow table to hash
-            prefix_hasher_id: Whether to prefix hash with hasher ID
-
-        Returns:
-            Hex string of the computed hash
-        """
-
-        # Step 1: Process columns with semantic types using visitor pattern
-        processed_table = self._process_table_columns(table)
-
-        # Step 2: Sort columns by name for deterministic ordering
-        sorted_table = self._sort_table_columns(processed_table)
-
-        # normalize all string to large strings (for compatibility with Polars)
-        normalized_table = arrow_utils.normalize_table_to_large_types(sorted_table)
-
-        # Step 3: Serialize using configured serialization method
-        serialized_bytes = self.serialize_arrow_table(normalized_table)
-
-        # Step 4: Compute final hash
-        hasher = hashlib.new(self.hash_algorithm)
-        hasher.update(serialized_bytes)
-
-        return ContentHash(method=self.hasher_id, digest=hasher.digest())
-
-    def hash_table_with_metadata(self, table: pa.Table) -> dict[str, Any]:  # noqa: C901
-        """
-        Compute hash with additional metadata about the process.
-
-        Returns:
-            Dictionary containing hash, metadata, and processing info
-        """
-        # Process table to see what transformations were made
-        processed_table = self._process_table_columns(table)
-
-        # Track processing steps
-        processed_columns = []
-        for i, (original_field, processed_field) in enumerate(
-            zip(table.schema, processed_table.schema)
-        ):
-            column_info = {
-                "name": original_field.name,
-                "original_type": str(original_field.type),
-                "processed_type": str(processed_field.type),
-                "was_processed": str(original_field.type) != str(processed_field.type),
-            }
-            processed_columns.append(column_info)
-
-        # Compute hash
-        table_hash = self.hash_table(table)
-
-        return {
-            "hash": table_hash,
-            "hasher_id": self.hasher_id,
-            "serialization_method": self.serialization_method,
-            "hash_algorithm": self.hash_algorithm,
-            "num_rows": len(table),
-            "num_columns": len(table.schema),
-            "processed_columns": processed_columns,
-            "column_order": [field.name for field in table.schema],
-        }
+if TYPE_CHECKING:
+    from orcapod.semantic_types.universal_converter import UniversalTypeConverter
+    from orcapod.protocols.hashing_protocols import SemanticHasherProtocol
 
 
 class StarfixArrowHasher:
-    """
-    Arrow table hasher backed by the starfix-python ``ArrowDigester``.
-
-    This hasher produces cross-language-compatible, deterministic content
-    addresses for Arrow tables and schemas by delegating to the canonical
-    StarFix specification (``starfix-python``).
+    """Arrow table hasher backed by the starfix-python ``ArrowDigester``.
 
     Pipeline
     --------
     1. **Semantic pre-processing** — the ``SemanticHashingVisitor`` traverses
-       every column and replaces recognised semantic types (e.g. ``Path``
-       structs) with their content-addressed hash strings.  This step runs
-       before the Arrow bytes are ever touched by starfix, so the final hash
-       captures *file content* for path-typed columns rather than the raw
-       path string.
-    2. **Starfix hashing** — ``ArrowDigester.hash_table`` (or
-       ``ArrowDigester.hash_schema``) is called on the pre-processed table /
-       schema.  The digester is column-order-independent and normalises
-       ``Utf8`` → ``LargeUtf8``, ``Binary`` → ``LargeBinary``, etc.,
-       producing a 35-byte versioned SHA-256 digest that is byte-for-byte
-       identical to the Rust ``starfix`` crate output.
+       every column. Extension-typed columns whose Python type has a registered
+       semantic hasher are replaced with ``pa.large_binary()`` hash tokens
+       (e.g. ``Path`` columns are replaced by their file-content hash).
+       Extension-typed columns without a registered hasher pass through with
+       their full extension metadata intact.
+    2. **Starfix hashing** — ``ArrowDigester.hash_table`` produces a 35-byte
+       versioned SHA-256 digest that is byte-for-byte identical to the Rust
+       ``starfix`` crate output.
 
     Parameters
     ----------
-    semantic_registry:
-        Registry of semantic type converters used during pre-processing.
+    type_converter:
+        ``UniversalTypeConverter`` used to resolve extension types to Python
+        types and convert storage values back to Python objects.
+    semantic_hasher:
+        ``SemanticHasherProtocol`` used to hash Python objects extracted
+        from extension-typed columns.
     hasher_id:
-        String identifier embedded in every ``ContentHash`` produced by
-        this hasher.  Bump this value whenever the hash algorithm changes
-        so that stored hashes remain distinguishable.
+        String identifier embedded in every ``ContentHash`` produced by this
+        hasher.
     """
 
     def __init__(
         self,
-        semantic_registry: SemanticTypeRegistry,
+        type_converter: "UniversalTypeConverter",
+        semantic_hasher: "SemanticHasherProtocol",
         hasher_id: str,
     ) -> None:
+        self._type_converter = type_converter
+        self._semantic_hasher = semantic_hasher
         self._hasher_id = hasher_id
-        self.semantic_registry = semantic_registry
 
     @property
     def hasher_id(self) -> str:
         return self._hasher_id
 
-    def _process_table_columns(self, table: pa.Table | pa.RecordBatch) -> pa.Table:
-        """Replace semantic-typed columns with their content-hash strings."""
-        new_columns: list[pa.Array] = []
+    def _process_table_columns(self, table: "pa.Table | pa.RecordBatch") -> "pa.Table":
+        """Replace semantic-typed columns with content-hash bytes; normalize extension columns.
+
+        For columns whose Python type has a registered semantic handler (e.g. ``Path``),
+        the extension-typed column is replaced by a ``pa.large_binary()`` column of
+        content-hash tokens.  For all other extension-typed columns (visitor passthrough),
+        the column is normalized to IPC storage representation via
+        ``normalize_extension_columns`` — storage type for the data, extension identity
+        in field metadata — so that ``ArrowDigester`` can hash them without encountering
+        a live ``pa.ExtensionType``, which is unhashable.
+        """
+        new_columns: list[pa.Array | pa.ChunkedArray] = []
         new_fields: list[pa.Field] = []
 
         for i, field in enumerate(table.schema):
-            # Short-circuit: primitive columns cannot contain semantic types, so skip
-            # the costly Python round-trip and reuse the original Arrow array directly.
+            # Short-circuit: columns that cannot contain semantic types skip
+            # the costly Python round-trip. Extension types must pass through
+            # so visit_extension can process them.
             if not (
-                pa.types.is_struct(field.type)
+                isinstance(field.type, pa.ExtensionType)
+                or pa.types.is_struct(field.type)
                 or pa.types.is_list(field.type)
                 or pa.types.is_large_list(field.type)
                 or pa.types.is_fixed_size_list(field.type)
@@ -301,28 +88,21 @@ class StarfixArrowHasher:
                 continue
 
             column_data = table.column(i).to_pylist()
-            visitor = SemanticHashingVisitor(self.semantic_registry)
+            visitor = SemanticHashingVisitor(self._type_converter, self._semantic_hasher)
 
             try:
                 new_type: pa.DataType | None = None
                 processed_data: list[Any] = []
                 for value in column_data:
                     processed_type, processed_value = visitor.visit(field.type, value)
-                    # Infer the output type from the first non-null processed value.
-                    # When the first row is null, visit_struct returns the original
-                    # struct type rather than the converted type (e.g. large_string),
-                    # which would cause pa.array() to fail for subsequent non-null rows.
                     if new_type is None and processed_value is not None:
                         new_type = processed_type
                     processed_data.append(processed_value)
 
-                # For empty or all-null columns there are no non-null values to infer
-                # the type from; fall back to the field's declared type.
                 if new_type is None:
                     new_type = field.type
+
                 new_columns.append(pa.array(processed_data, type=new_type))
-                # Preserve original field attributes (nullable, metadata) while
-                # updating only the type, so the schema fed to starfix remains faithful.
                 new_fields.append(field.with_type(new_type))
 
             except Exception as exc:
@@ -330,48 +110,38 @@ class StarfixArrowHasher:
                     f"Failed to process column '{field.name}': {exc}"
                 ) from exc
 
-        # Preserve the original schema-level metadata while using updated fields.
-        return pa.table(new_columns, schema=pa.schema(new_fields, metadata=table.schema.metadata))
+        intermediate = pa.table(
+            new_columns,
+            schema=pa.schema(new_fields, metadata=table.schema.metadata),
+        )
+        # Normalize any remaining extension-typed columns to their IPC storage
+        # representation (storage type + ARROW:extension:* field metadata).
+        # This handles the visitor passthrough case — extension types with no
+        # registered semantic handler — so that ArrowDigester never receives a
+        # live pa.ExtensionType, which is unhashable and would crash starfix.
+        return normalize_extension_columns(intermediate)
 
-    def hash_schema(self, schema: pa.Schema) -> ContentHash:
-        """Hash an Arrow schema using the starfix canonical algorithm.
-
-        Parameters
-        ----------
-        schema:
-            The ``pyarrow.Schema`` to hash.
-
-        Returns
-        -------
-        ContentHash
-            A ``ContentHash`` whose ``digest`` is the 35-byte versioned
-            SHA-256 produced by ``ArrowDigester.hash_schema``.
-        """
-        digest = ArrowDigester.hash_schema(schema)
+    def hash_schema(self, schema: "pa.Schema") -> ContentHash:
+        """Hash an Arrow schema using the starfix canonical algorithm."""
+        include_meta = has_extension_metadata(schema)
+        if include_meta:
+            schema = clean_schema_for_hashing(schema)
+        digest = ArrowDigester.hash_schema(schema, include_metadata=include_meta)
         return ContentHash(method=self._hasher_id, digest=digest)
 
-    def hash_table(self, table: pa.Table | pa.RecordBatch) -> ContentHash:
-        """Hash an Arrow table (or ``RecordBatch``) using starfix.
-
-        Semantic types are resolved to their content-hash strings before
-        the table is passed to ``ArrowDigester.hash_table``, ensuring that
-        path-typed columns contribute their *file content* hash rather than
-        the literal path string.
-
-        Parameters
-        ----------
-        table:
-            The ``pa.Table`` or ``pa.RecordBatch`` to hash.
-
-        Returns
-        -------
-        ContentHash
-            A ``ContentHash`` whose ``digest`` is the 35-byte versioned
-            SHA-256 produced by ``ArrowDigester.hash_table``.
-        """
+    def hash_table(self, table: "pa.Table | pa.RecordBatch") -> ContentHash:
+        """Hash an Arrow table (or ``RecordBatch``) using starfix."""
         if isinstance(table, pa.RecordBatch):
             table = pa.Table.from_batches([table])
 
         processed_table = self._process_table_columns(table)
-        digest = ArrowDigester.hash_table(processed_table)
+        include_meta = has_extension_metadata(processed_table.schema)
+        if include_meta:
+            clean_schema = clean_schema_for_hashing(processed_table.schema)
+            clean_table = pa.Table.from_arrays(
+                processed_table.columns, schema=clean_schema
+            )
+        else:
+            clean_table = processed_table
+        digest = ArrowDigester.hash_table(clean_table, include_metadata=include_meta)
         return ContentHash(method=self._hasher_id, digest=digest)

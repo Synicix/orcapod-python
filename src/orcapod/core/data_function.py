@@ -4,6 +4,7 @@ import inspect
 import logging
 import re
 import sys
+import uuid
 from abc import abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 import typing
@@ -11,7 +12,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, TypeVar
 
 from uuid_utils import uuid7
 
-from orcapod.config import Config
+from orcapod.config import OrcapodConfig
 from orcapod.contexts import DataContext
 from orcapod.core.base import TraceableBase
 from orcapod.core.datagrams import Datagram, Data
@@ -135,7 +136,7 @@ class DataFunctionBase(TraceableBase, Generic[E]):
         version: str = "v0.0",
         label: str | None = None,
         data_context: str | DataContext | None = None,
-        config: Config | None = None,
+        config: OrcapodConfig | None = None,
         executor: DataFunctionExecutorProtocol | None = None,
     ):
         super().__init__(label=label, data_context=data_context, config=config)
@@ -300,12 +301,18 @@ class DataFunctionBase(TraceableBase, Generic[E]):
         data: DataProtocol,
         *,
         logger: DataExecutionLoggerProtocol | None = None,
+        **kwargs: Any,
     ) -> DataProtocol | None:
         """Process a single data.
 
         Base implementation calls ``direct_call``.  Subclasses that support
         executors (e.g. ``PythonDataFunction``) override to route through
         the executor's ``execute_callable``.
+
+        ``**kwargs`` are forwarded to ``direct_call`` and merged into the
+        function call dict alongside the data fields.  Callers (e.g. a pod)
+        use this to supply auto-provided arguments such as an
+        ``InvocationContext`` that are not part of the data schema.
         """
         if logger is not None and self._executor is None:
             import warnings
@@ -315,18 +322,22 @@ class DataFunctionBase(TraceableBase, Generic[E]):
                 "capture will not occur. Set an executor to enable logging.",
                 stacklevel=2,
             )
-        return self.direct_call(data)
+        return self.direct_call(data, **kwargs)
 
     async def async_call(
         self,
         data: DataProtocol,
         *,
         logger: DataExecutionLoggerProtocol | None = None,
+        **kwargs: Any,
     ) -> DataProtocol | None:
         """Asynchronously process a single data.
 
         Base implementation calls ``direct_async_call``.  Subclasses that
         support executors override to route through the executor.
+
+        ``**kwargs`` are forwarded to ``direct_async_call`` and merged into
+        the function call dict alongside the data fields.
         """
         if logger is not None and self._executor is None:
             import warnings
@@ -336,23 +347,26 @@ class DataFunctionBase(TraceableBase, Generic[E]):
                 "capture will not occur. Set an executor to enable logging.",
                 stacklevel=2,
             )
-        return await self.direct_async_call(data)
+        return await self.direct_async_call(data, **kwargs)
 
     @abstractmethod
     def direct_call(
-        self, data: DataProtocol
+        self, data: DataProtocol, **kwargs: Any
     ) -> DataProtocol | None:
         """Execute the function's native computation on *data*.
 
         This is the method executors invoke.  It bypasses executor routing
         and runs the computation directly.  On user-function failure the
         exception is re-raised.  Subclasses must implement this.
+
+        ``**kwargs`` are merged with ``data.as_dict()`` before the underlying
+        callable is invoked.
         """
         ...
 
     @abstractmethod
     async def direct_async_call(
-        self, data: DataProtocol
+        self, data: DataProtocol, **kwargs: Any
     ) -> DataProtocol | None:
         """Asynchronous counterpart of ``direct_call``."""
         ...
@@ -374,7 +388,7 @@ class PythonDataFunction(DataFunctionBase[PythonFunctionExecutorProtocol]):
         output_schema: SchemaLike | Sequence[type] | None = None,
         label: str | None = None,
         data_context: str | DataContext | None = None,
-        config: Config | None = None,
+        config: OrcapodConfig | None = None,
         executor: PythonFunctionExecutorProtocol | None = None,
     ) -> None:
 
@@ -449,13 +463,10 @@ class PythonDataFunction(DataFunctionBase[PythonFunctionExecutorProtocol]):
         semantic_hasher = self.data_context.semantic_hasher
         self._function_signature_hash = semantic_hasher.hash_object(
             get_function_signature(function)
-        ).to_string()
+        ).to_prefixed_digest()
         self._function_content_hash = semantic_hasher.hash_object(
             get_function_components(self._function)
-        ).to_string()
-        self._output_schema_hash = semantic_hasher.hash_object(
-            self.output_data_schema
-        ).to_string()
+        ).to_prefixed_digest()
 
     @property
     def canonical_function_name(self) -> str:
@@ -475,8 +486,8 @@ class PythonDataFunction(DataFunctionBase[PythonFunctionExecutorProtocol]):
         """Schema for the data returned by ``get_function_variation_data``."""
         return Schema({
             "function_name": str,
-            "function_signature_hash": str,
-            "function_content_hash": str,
+            "function_signature_hash": bytes,
+            "function_content_hash": bytes,
             "git_hash": str,
         })
 
@@ -552,18 +563,18 @@ class PythonDataFunction(DataFunctionBase[PythonFunctionExecutorProtocol]):
             inner_parsed = [":".join(component) for component in components]
             return "::".join(inner_parsed)
 
-        record_id = str(uuid7())
-        source_info = {k: combine(self.uri, (record_id,), (k,)) for k in output_data}
+        new_record_uuid = uuid.UUID(bytes=uuid7().bytes)
+        source_info = {k: combine(self.uri, (new_record_uuid.hex,), (k,)) for k in output_data}
 
         return Data(
             output_data,
             source_info=source_info,
-            record_id=record_id,
+            record_uuid=new_record_uuid,
             python_schema=self.output_data_schema,
             data_context=self.data_context,
         )
 
-    def _call_async_function_sync(self, data: DataProtocol) -> Any:
+    def _call_async_function_sync(self, data: DataProtocol, **kwargs: Any) -> Any:
         """Run the wrapped async function synchronously.
 
         Uses ``asyncio.run()`` when no event loop is running. When called
@@ -576,25 +587,27 @@ class PythonDataFunction(DataFunctionBase[PythonFunctionExecutorProtocol]):
 
         Args:
             data: The input data whose dict form is passed to the function.
+            **kwargs: Additional keyword arguments merged with ``data.as_dict()``
+                before the function is called.
 
         Returns:
             The raw return value of the async function.
         """
         import asyncio
 
-        kwargs = data.as_dict()
+        call_dict = {**data.as_dict(), **kwargs}
         fn = self._function
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             # No running loop — safe to use asyncio.run()
-            return asyncio.run(fn(**kwargs))
+            return asyncio.run(fn(**call_dict))
         else:
             # Already in a loop — run in a separate thread with its own loop.
             # The lambda ensures the coroutine is created inside the executor
             # thread, avoiding unawaited-coroutine warnings on submission failure.
             return (
-                _get_sync_executor().submit(lambda: asyncio.run(fn(**kwargs))).result()
+                _get_sync_executor().submit(lambda: asyncio.run(fn(**call_dict))).result()
             )
 
     def call(
@@ -602,18 +615,27 @@ class PythonDataFunction(DataFunctionBase[PythonFunctionExecutorProtocol]):
         data: DataProtocol,
         *,
         logger: DataExecutionLoggerProtocol | None = None,
+        **kwargs: Any,
     ) -> DataProtocol | None:
         """Process a single data, routing through the executor if one is set.
 
         When an executor implementing ``PythonFunctionExecutorProtocol`` is
-        set, the raw callable and kwargs are handed to ``execute_callable``
+        set, the raw callable and call dict are handed to ``execute_callable``
         which captures I/O and records to the logger.
+
+        Args:
+            data: The input data to process.
+            logger: Optional logger for I/O capture.
+            **kwargs: Extra keyword arguments merged with ``data.as_dict()``
+                before invoking the function. Pods use this to supply
+                auto-provided arguments (e.g. ``InvocationContext``) that
+                are not part of the data schema.
         """
         if self._executor is not None:
             if not self._active:
                 return None
             raw = self._executor.execute_callable(
-                self._function, data.as_dict(), logger=logger
+                self._function, {**data.as_dict(), **kwargs}, logger=logger
             )
             return self._build_output_data(raw)
         if logger is not None:
@@ -624,20 +646,21 @@ class PythonDataFunction(DataFunctionBase[PythonFunctionExecutorProtocol]):
                 "capture will not occur. Set an executor to enable logging.",
                 stacklevel=2,
             )
-        return self.direct_call(data)
+        return self.direct_call(data, **kwargs)
 
     async def async_call(
         self,
         data: DataProtocol,
         *,
         logger: DataExecutionLoggerProtocol | None = None,
+        **kwargs: Any,
     ) -> DataProtocol | None:
         """Async counterpart of ``call``."""
         if self._executor is not None:
             if not self._active:
                 return None
             raw = await self._executor.async_execute_callable(
-                self._function, data.as_dict(), logger=logger
+                self._function, {**data.as_dict(), **kwargs}, logger=logger
             )
             return self._build_output_data(raw)
         if logger is not None:
@@ -648,42 +671,53 @@ class PythonDataFunction(DataFunctionBase[PythonFunctionExecutorProtocol]):
                 "capture will not occur. Set an executor to enable logging.",
                 stacklevel=2,
             )
-        return await self.direct_async_call(data)
+        return await self.direct_async_call(data, **kwargs)
 
     def direct_call(
-        self, data: DataProtocol
+        self, data: DataProtocol, **kwargs: Any
     ) -> DataProtocol | None:
         """Execute the function on *data* synchronously (no executor path).
 
         On user-function failure the exception is re-raised.
         For async functions, the coroutine is driven to completion via
         ``asyncio.run()`` (or a helper thread when already inside an event loop).
+
+        Args:
+            data: The input data to process.
+            **kwargs: Extra keyword arguments merged with ``data.as_dict()``
+                before invoking the function.
         """
         if not self._active:
             return None
 
         if self._is_async:
-            raw_result = self._call_async_function_sync(data)
+            raw_result = self._call_async_function_sync(data, **kwargs)
         else:
-            raw_result = self._function(**data.as_dict())
+            raw_result = self._function(**data.as_dict(), **kwargs)
         return self._build_output_data(raw_result)
 
     async def direct_async_call(
-        self, data: DataProtocol
+        self, data: DataProtocol, **kwargs: Any
     ) -> DataProtocol | None:
         """Execute the function on *data* asynchronously (no executor path).
 
         Async functions are ``await``-ed directly. Sync functions are
         offloaded to a thread pool via ``run_in_executor``.  On failure,
         the exception is re-raised.
+
+        Args:
+            data: The input data to process.
+            **kwargs: Extra keyword arguments merged with ``data.as_dict()``
+                before invoking the function.
         """
         import asyncio
 
         if not self._active:
             return None
 
+        call_dict = {**data.as_dict(), **kwargs}
         if self._is_async:
-            raw_result = await self._function(**data.as_dict())
+            raw_result = await self._function(**call_dict)
         else:
             import contextvars
             import functools
@@ -695,7 +729,7 @@ class PythonDataFunction(DataFunctionBase[PythonFunctionExecutorProtocol]):
                 functools.partial(
                     task_ctx.run,
                     self._function,
-                    **data.as_dict(),
+                    **call_dict,
                 ),
             )
         return self._build_output_data(raw_result)
@@ -859,26 +893,28 @@ class DataFunctionWrapper(DataFunctionBase[E]):
         data: DataProtocol,
         *,
         logger: DataExecutionLoggerProtocol | None = None,
+        **kwargs: Any,
     ) -> DataProtocol | None:
-        return self._data_function.call(data, logger=logger)
+        return self._data_function.call(data, logger=logger, **kwargs)
 
     async def async_call(
         self,
         data: DataProtocol,
         *,
         logger: DataExecutionLoggerProtocol | None = None,
+        **kwargs: Any,
     ) -> DataProtocol | None:
-        return await self._data_function.async_call(data, logger=logger)
+        return await self._data_function.async_call(data, logger=logger, **kwargs)
 
     def direct_call(
-        self, data: DataProtocol
+        self, data: DataProtocol, **kwargs: Any
     ) -> DataProtocol | None:
-        return self._data_function.direct_call(data)
+        return self._data_function.direct_call(data, **kwargs)
 
     async def direct_async_call(
-        self, data: DataProtocol
+        self, data: DataProtocol, **kwargs: Any
     ) -> DataProtocol | None:
-        return await self._data_function.direct_async_call(data)
+        return await self._data_function.direct_async_call(data, **kwargs)
 
 
 class CachedDataFunction(DataFunctionWrapper):
@@ -927,7 +963,7 @@ class CachedDataFunction(DataFunctionWrapper):
 
     @property
     def record_path(self) -> tuple[str, ...]:
-        """Return the path to the record in the result store."""
+        """Return the path to the cached records in the result store (versioned)."""
         return self._cache.record_path
 
     def call(
@@ -937,7 +973,16 @@ class CachedDataFunction(DataFunctionWrapper):
         logger: DataExecutionLoggerProtocol | None = None,
         skip_cache_lookup: bool = False,
         skip_cache_insert: bool = False,
+        **kwargs: Any,
     ) -> DataProtocol | None:
+        """Look up cache keyed on ``data``; on miss, call and store result.
+
+        ``**kwargs`` are forwarded to the wrapped data function's ``call``
+        so that auto-provided arguments (e.g. ``InvocationContext``) reach
+        the underlying function.  They are intentionally excluded from the
+        cache key — such arguments are deterministic per row and pod, so the
+        same input data always produces the same output.
+        """
         output_data = None
         if not skip_cache_lookup:
             module_logger.info("Checking for cache...")
@@ -945,7 +990,7 @@ class CachedDataFunction(DataFunctionWrapper):
             if output_data is not None:
                 module_logger.info(f"Cache hit for {data}!")
                 return output_data
-        output_data = self._data_function.call(data, logger=logger)
+        output_data = self._data_function.call(data, logger=logger, **kwargs)
         if output_data is not None:
             if not skip_cache_insert:
                 var_dg, exec_dg = self._build_metadata_datagrams()
@@ -962,6 +1007,7 @@ class CachedDataFunction(DataFunctionWrapper):
         logger: DataExecutionLoggerProtocol | None = None,
         skip_cache_lookup: bool = False,
         skip_cache_insert: bool = False,
+        **kwargs: Any,
     ) -> DataProtocol | None:
         """Async counterpart of ``call`` with cache check and recording."""
         output_data = None
@@ -971,7 +1017,7 @@ class CachedDataFunction(DataFunctionWrapper):
             if output_data is not None:
                 module_logger.info(f"Cache hit for {data}!")
                 return output_data
-        output_data = await self._data_function.async_call(data, logger=logger)
+        output_data = await self._data_function.async_call(data, logger=logger, **kwargs)
         if output_data is not None:
             if not skip_cache_insert:
                 var_dg, exec_dg = self._build_metadata_datagrams()

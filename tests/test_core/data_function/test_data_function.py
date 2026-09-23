@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 
 import pytest
 
 from orcapod.core.datagrams import Data
 from orcapod.core.data_function import PythonDataFunction, parse_function_outputs
 from orcapod.protocols.core_protocols import DataFunctionProtocol
+from orcapod.types import ContentHash
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -364,10 +366,10 @@ class TestGetFunctionVariationData:
             "git_hash",
         }
 
-    def test_all_values_are_strings(self, add_pf):
+    def test_non_hash_values_are_strings(self, add_pf):
         data = add_pf.get_function_variation_data()
-        for k, v in data.items():
-            assert isinstance(v, str), f"Value for '{k}' is not a string: {v!r}"
+        assert isinstance(data["function_name"], str)
+        assert isinstance(data["git_hash"], str)
 
     def test_function_name_matches_canonical(self, add_pf):
         data = add_pf.get_function_variation_data()
@@ -521,12 +523,16 @@ class TestCall:
 
         result = add_pf.call(add_data)
         source_str = result.source_info()["result"]
-        # The record_id segment is between the URI components and the key name
-        # Format: uri_part1:uri_part2:..::record_id::key
-        uuid_pattern = re.compile(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        # Format: <uri_components_colon_joined>::<record_id_hex>::<key>
+        # Extract the second "::" segment which is always the UUID hex.
+        parts = source_str.split("::")
+        assert len(parts) == 3, (
+            f"Expected exactly 3 '::'-separated segments in {source_str!r}, got {len(parts)}"
         )
-        assert uuid_pattern.search(source_str), f"No UUID found in {source_str!r}"
+        uuid_hex_segment = parts[1]
+        assert re.fullmatch(r"[0-9a-f]{32}", uuid_hex_segment), (
+            f"Record ID segment {uuid_hex_segment!r} is not a 32-char lowercase hex string"
+        )
 
     def test_inactive_returns_none(self, add_pf, add_data):
         add_pf.set_active(False)
@@ -719,3 +725,118 @@ class TestAsyncFunctionAsyncCall:
         result = asyncio.run(async_multi_pf.async_call(data))
         assert result["sum"] == 7
         assert result["product"] == 12
+
+
+# ---------------------------------------------------------------------------
+# TestSignatureHashUnionOrderIndependence
+# ---------------------------------------------------------------------------
+
+
+class TestSignatureHashUnionOrderIndependence:
+    """_function_signature_hash must be order-independent over union members."""
+
+    def _sig_hash(self, func):
+        # PythonDataFunction is already imported at the top of this test file.
+        df = PythonDataFunction(func, output_keys="result")
+        return df.get_function_variation_data()["function_signature_hash"]
+
+    def test_two_member_union_param_order_independent(self):
+        """str | Path and Path | str produce the same signature hash."""
+        def foo(x: str | Path) -> str:
+            return str(x)
+        h1 = self._sig_hash(foo)
+
+        def foo(x: Path | str) -> str:
+            return str(x)
+        h2 = self._sig_hash(foo)
+
+        assert h1 == h2
+
+    def test_three_member_union_all_permutations(self):
+        """All permutations of str | Path | bytes produce the same signature hash."""
+        def foo(x: str | Path | bytes) -> str:
+            return str(x)
+        h1 = self._sig_hash(foo)
+
+        def foo(x: bytes | str | Path) -> str:
+            return str(x)
+        h2 = self._sig_hash(foo)
+
+        def foo(x: Path | bytes | str) -> str:
+            return str(x)
+        h3 = self._sig_hash(foo)
+
+        assert h2 == h1
+        assert h3 == h1
+
+    def test_return_type_union_order_independent(self):
+        """Return-type unions are also order-independent."""
+        def foo(x: int) -> str | Path:
+            return str(x)
+        h1 = self._sig_hash(foo)
+
+        def foo(x: int) -> Path | str:
+            return str(x)
+        h2 = self._sig_hash(foo)
+
+        assert h1 == h2
+
+    def test_non_union_param_hash_unchanged(self):
+        """A non-union function's signature hash is stable and unaffected by the union fix."""
+        def foo(x: int) -> str:
+            return str(x)
+
+        # Hash must be deterministic across multiple calls.
+        # This exercises that the fix does not disturb non-union annotations.
+        h1 = self._sig_hash(foo)
+        h2 = self._sig_hash(foo)
+        assert h1 == h2
+
+    def test_different_union_types_still_differ(self):
+        """str | Path and str | bytes are different and must not hash the same."""
+        def foo(x: str | Path) -> str:
+            return str(x)
+        h1 = self._sig_hash(foo)
+
+        def foo(x: str | bytes) -> str:
+            return str(x)
+        h2 = self._sig_hash(foo)
+
+        assert h1 != h2
+
+    def test_union_vs_non_union_differ(self):
+        """A union-typed param and a plain-typed param produce different hashes."""
+        def foo(x: str | Path) -> str:
+            return str(x)
+        h1 = self._sig_hash(foo)
+
+        def foo(x: str) -> str:
+            return str(x)
+        h2 = self._sig_hash(foo)
+
+        assert h1 != h2
+
+
+class TestVariationHashSchema:
+    def test_function_signature_hash_is_bytes(self, add_pf):
+        """PythonDataFunction stores variation hashes as bytes (-> large_binary)."""
+        variation = add_pf.get_function_variation_data()
+        assert isinstance(variation["function_signature_hash"], bytes)
+
+    def test_function_content_hash_is_bytes(self, add_pf):
+        """PythonDataFunction stores content hashes as bytes (-> large_binary)."""
+        variation = add_pf.get_function_variation_data()
+        assert isinstance(variation["function_content_hash"], bytes)
+
+    def test_variation_schema_has_bytes_types(self, add_pf):
+        schema = add_pf.get_function_variation_data_schema()
+        assert schema["function_signature_hash"] is bytes
+        assert schema["function_content_hash"] is bytes
+
+    def test_variation_hash_decodes_to_content_hash(self, add_pf):
+        """Both variation hash bytes round-trip through ContentHash.from_prefixed_digest."""
+        variation = add_pf.get_function_variation_data()
+        sig_hash = ContentHash.from_prefixed_digest(variation["function_signature_hash"])
+        content_hash = ContentHash.from_prefixed_digest(variation["function_content_hash"])
+        assert isinstance(sig_hash, ContentHash)
+        assert isinstance(content_hash, ContentHash)

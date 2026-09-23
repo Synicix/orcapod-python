@@ -46,6 +46,15 @@ class DataFunctionProtocol(
         ...
 
     @property
+    def uri(self) -> tuple[str, ...]:
+        """Stable, content-addressable identifier for this data function.
+
+        Returns a tuple of strings uniquely identifying the function by name,
+        output schema hash, major version, and function type.
+        """
+        ...
+
+    @property
     def input_data_schema(self) -> Schema:
         """Schema describing the input data this function accepts."""
         ...
@@ -91,12 +100,17 @@ class DataFunctionProtocol(
         data: DataProtocol,
         *,
         logger: "DataExecutionLoggerProtocol | None" = None,
+        **kwargs: Any,
     ) -> DataProtocol | None:
         """Process a single data, routing through the executor if one is set.
 
         Args:
             data: The data payload to process.
             logger: Optional logger for recording captured I/O.
+            **kwargs: Extra keyword arguments merged with ``data.as_dict()``
+                before the underlying callable is invoked. Pods use this to
+                supply auto-provided arguments (e.g. ``InvocationContext``)
+                that are not part of the data schema.
 
         Returns:
             The output data, or ``None`` when the function filters the
@@ -109,12 +123,15 @@ class DataFunctionProtocol(
         data: DataProtocol,
         *,
         logger: "DataExecutionLoggerProtocol | None" = None,
+        **kwargs: Any,
     ) -> DataProtocol | None:
         """Asynchronously process a single data, routing through the executor if set.
 
         Args:
             data: The data payload to process.
             logger: Optional logger for recording captured I/O.
+            **kwargs: Extra keyword arguments merged with ``data.as_dict()``
+                before the underlying callable is invoked.
 
         Returns:
             The output data, or ``None``.
@@ -124,6 +141,7 @@ class DataFunctionProtocol(
     def direct_call(
         self,
         data: DataProtocol,
+        **kwargs: Any,
     ) -> DataProtocol | None:
         """Execute the function's native computation on *data*.
 
@@ -132,6 +150,8 @@ class DataFunctionProtocol(
 
         Args:
             data: The data payload to process.
+            **kwargs: Extra keyword arguments merged with ``data.as_dict()``
+                before the underlying callable is invoked.
 
         Returns:
             The output data, or ``None`` if filtered.
@@ -141,6 +161,7 @@ class DataFunctionProtocol(
     async def direct_async_call(
         self,
         data: DataProtocol,
+        **kwargs: Any,
     ) -> DataProtocol | None:
         """Asynchronous counterpart of ``direct_call``."""
         ...

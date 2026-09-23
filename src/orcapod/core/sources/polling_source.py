@@ -1,0 +1,975 @@
+"""Protocol-based polling source for async pipelines.
+
+Provides ``PollingSource``, a ``RootSource`` that wraps a
+``DynamicSourceProtocol`` implementation. The framework handles scheduling,
+cursor tracking, cache management, error handling, and shutdown; the
+implementation only supplies ``identity``, ``to_config``, ``from_config``,
+``poll``, ``fetch``, and ``close``.
+"""
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import functools
+import logging
+import threading
+from collections.abc import Collection
+from math import floor
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
+
+from orcapod.core.sources.base import RootSource
+from orcapod.core.sources.stream_builder import SourceStreamBuilder
+from orcapod.errors import CursorInvalidatedError, InputValidationError, SchemaInconsistencyError
+from orcapod.types import ColumnConfig, Cursor, PollingConfig, Schema
+from orcapod.utils import arrow_utils, polars_data_utils
+from orcapod.utils.arrow_utils import system_tag_column_names
+from orcapod.utils.lazy_module import LazyModule
+from orcapod.utils.schema_utils import _normalize_column_list, compute_source_schema_hash
+
+if TYPE_CHECKING:
+    import polars as pl
+    import pyarrow as pa
+    from polars._typing import FrameInitTypes
+
+    from orcapod.core.streams.arrow_table_stream import ArrowTableStream
+    from orcapod.protocols.core_protocols.sources import DynamicSourceProtocol
+    from orcapod.types import Schema
+
+else:
+    pa = LazyModule("pyarrow")
+    pl = LazyModule("polars")
+
+T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Module-level sync executor (mirrors data_function.py pattern)
+# ---------------------------------------------------------------------------
+
+_sync_executor = None
+
+
+def _get_sync_executor():
+    global _sync_executor
+    if _sync_executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _sync_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="polling_source_sync"
+        )
+    return _sync_executor
+
+
+def _run_sync(async_fn, *args, **kwargs):
+    """Run ``async_fn(*args, **kwargs)`` synchronously.
+
+    Safe to call from within a running event loop — uses a thread-based
+    executor in that case (same pattern as ``data_function.py``). The
+    coroutine is created inside the executor thread so it is always owned by
+    the loop that runs it.
+
+    Args:
+        async_fn: An async callable (coroutine function).
+        *args: Positional arguments forwarded to *async_fn*.
+        **kwargs: Keyword arguments forwarded to *async_fn*.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(async_fn(*args, **kwargs))
+    else:
+        return _get_sync_executor().submit(
+            lambda: asyncio.run(async_fn(*args, **kwargs))
+        ).result()
+
+
+def _assert_schema_match(
+    schema_kind: str,
+    declared: Schema,
+    actual: Schema,
+    source_id: str | None,
+) -> None:
+    """Raise ``SchemaInconsistencyError`` when *actual* is incompatible with *declared*.
+
+    Checks that every field in *declared* is present in *actual* with the same
+    type. Extra fields in *actual* are allowed.
+
+    Args:
+        schema_kind: Human-readable label (``"tag"`` or ``"data"``) used in
+            the error message.
+        declared: The expected schema (e.g. from ``tag_schema`` / ``data_schema``
+            constructor arguments, or the accumulated stream's schema).
+        actual: The observed schema from the most recently fetched data.
+        source_id: Source identifier for error messages.
+
+    Raises:
+        SchemaInconsistencyError: If any declared field is absent from *actual* or
+            has a mismatched type.
+    """
+    mismatches: list[str] = []
+    for field, expected_type in declared.items():
+        if field not in actual:
+            mismatches.append(f"{field!r} missing from fetched data")
+        elif actual[field] != expected_type:
+            mismatches.append(
+                f"{field!r}: declared {expected_type!r}, got {actual[field]!r}"
+            )
+    if mismatches:
+        raise SchemaInconsistencyError(
+            f"PollingSource {source_id!r}: {schema_kind} schema incompatible — "
+            + "; ".join(mismatches)
+        )
+
+
+# ColumnConfig used when concatenating streams in _combine.
+# Includes the provenance columns (system_tags, source, context) that
+# ArrowTableStream.__init__ knows how to parse and split into their
+# respective internal tables.
+# content_hash is intentionally absent: it is a synthetic, on-demand
+# column produced by as_table(); including it would bake it into stored
+# data and corrupt the data schema on the next combine.
+_STREAM_COMBINE_COLUMNS = ColumnConfig(system_tags=True, source=True, context=True)
+
+
+# ---------------------------------------------------------------------------
+# PollingSource
+# ---------------------------------------------------------------------------
+
+
+class PollingSource(RootSource, Generic[T]):
+    """A root source that continuously emits data via a polling loop.
+
+    Wraps a ``DynamicSourceProtocol`` implementation. Under async execution
+    (``async_iter_data``), the framework polls the impl on a fixed interval
+    and yields new rows as they arrive. Under sync execution (``iter_data``),
+    a single poll+fetch cycle is performed on each access and results are
+    served from an accumulated in-memory cache.
+
+    The default ``PollingConfig()`` polls every 1 second, runs indefinitely
+    (``duration=0`` means run until cancelled), allows up to 5 consecutive
+    overrun intervals before terminating (an overrun interval is one that was
+    consumed while the previous poll iteration was still executing — i.e. the
+    loop fell behind its scheduled tick), retries up to 3 consecutive
+    ``poll()``/``fetch()`` errors with 1-second exponential backoff, and
+    resets error and overrun counters on every clean tick.
+
+    Schema declaration:
+        If ``impl.schema()`` returns a non-``None`` ``Schema``, it is treated
+        as the declared unified column schema and split by ``tag_columns`` into
+        ``_tag_schema`` (tag columns) and ``_data_schema`` (all remaining
+        columns). This enables ``output_schema()`` and ``keys()`` to answer
+        without triggering a fetch. If ``impl.schema()`` returns ``None``,
+        schema is inferred from the first batch returned by ``fetch()``.
+
+    Iteration order guarantee:
+        Both sync (``iter_data``) and async (``async_iter_data``) iteration
+        always drain the accumulated stream first, then continue polling from
+        the saved cursor. This ensures that data fetched for schema inference
+        (or by a previous iteration) is never skipped or re-fetched.
+
+    Args:
+        impl: User-supplied ``DynamicSourceProtocol`` implementation that
+            provides ``identity``, ``to_config``, ``from_config``, ``poll``,
+            ``fetch``, ``close``, and ``schema`` methods.
+        tag_columns: Column name(s) that form the tag (join key) for each
+            row. All other columns become data columns.
+        polling_config: Scheduling and error-handling configuration.
+            See ``PollingConfig`` for field semantics and defaults.
+            All fields are validated at construction — ``ValueError`` is
+            raised for out-of-range values.
+        source_id: Optional stable string identifier for provenance tracking.
+            Defaults to ``str(impl.identity())`` when omitted.
+        label: Optional human-readable label shown in pipeline diagrams.
+        data_context: Optional data context key or instance for type
+            conversion and hashing.
+        config: Optional Orcapod framework config.
+
+    Raises:
+        ValueError: If ``impl.schema()`` returns a non-``None`` schema that
+            does not include all columns named in ``tag_columns``.
+
+    Example::
+
+        class MyDBSource:
+            def __init__(self, db_url):
+                self._db_url = db_url
+
+            def identity(self):
+                return ("MyDBSource", self._db_url)
+
+            def to_config(self):
+                return {"url": self._db_url}
+
+            @classmethod
+            def from_config(cls, config):
+                return cls(config["url"])
+
+            def schema(self):
+                return Schema({"row_id": int, "value": float})
+
+            async def poll(self, cursor=None):
+                return await self._check_has_new_rows(since=cursor)
+
+            async def fetch(self, cursor=None):
+                rows, new_cursor = await self._fetch_rows(since=cursor)
+                return Cursor.now(new_cursor), rows
+
+            async def close(self):
+                await self._conn.close()
+
+        # Poll every 5 s, run for 60 s, raise after 3 consecutive errors
+        src = PollingSource(
+            MyDBSource("postgresql://..."),
+            tag_columns="row_id",
+            polling_config=PollingConfig(interval=5.0, duration=60.0),
+        )
+
+    Note:
+        Sync mode calls ``asyncio.run()`` (or a ``ThreadPoolExecutor``
+        when called from within a running event loop). This can fail in
+        Jupyter notebooks without a nest-asyncio shim. Async mode has no
+        such restriction.
+
+    Note:
+        The accumulated in-memory cache grows unboundedly for true-delta
+        implementations. No eviction policy is implemented.
+    """
+
+    def __init__(
+        self,
+        impl: DynamicSourceProtocol[T],
+        tag_columns: str | Collection[str],
+        polling_config: PollingConfig = PollingConfig(),
+        source_id: str | None = None,
+        label: str | None = None,
+        data_context: str | Any | None = None,
+        config: Any | None = None,
+    ) -> None:
+        super().__init__(
+            source_id=source_id,
+            label=label,
+            data_context=data_context,
+            config=config,
+        )
+        self._impl: DynamicSourceProtocol[T] = impl
+        self._tag_columns: tuple[str, ...] = tuple(_normalize_column_list(tag_columns))
+        self._polling_config = polling_config
+        self._cursor: Cursor[T] | None = None
+        self._batches: list[ArrowTableStream] = []
+        self._state_lock: threading.Lock = threading.Lock()
+        self._canonical_arrow_schema: pa.Schema | None = None
+        # Derive source_id from impl identity if not explicitly provided
+        if self._source_id is None:
+            self._source_id = str(self._impl.identity())
+        # Split impl.schema() into tag/data schemas
+        self._tag_schema: Schema | None = None
+        self._data_schema: Schema | None = None
+        unified_schema = self._impl.schema()
+        if unified_schema is not None:
+            tag_cols_set = set(self._tag_columns)
+            missing = tag_cols_set - set(unified_schema.keys())
+            if missing:
+                raise ValueError(
+                    f"PollingSource: impl.schema() is missing tag columns "
+                    f"{sorted(missing)!r}. All tag_columns must be present "
+                    f"in the schema declared by impl.schema()."
+                )
+            self._tag_schema = Schema(
+                {k: v for k, v in unified_schema.items() if k in tag_cols_set}
+            )
+            self._data_schema = Schema(
+                {k: v for k, v in unified_schema.items() if k not in tag_cols_set}
+            )
+
+    # -------------------------------------------------------------------------
+    # Schema helpers — fetch-free schema computation from declared schemas
+    # -------------------------------------------------------------------------
+
+    @functools.cached_property
+    def _declared_schema_hash(self) -> str | None:
+        """Schema hash used to derive system-tag column names without fetching data.
+
+        When ``SourceStreamBuilder`` materialises a source stream it embeds a
+        schema hash in the two system-tag column names::
+
+            _tag::source:<HASH>   →  source-ID column (str)
+            _tag::source:<HASH>::record_id  →  record-ID column (bytes)
+
+        where ``<HASH>`` is produced by ``compute_source_schema_hash(tag_schema,
+        data_schema, data_context, config)``.
+
+        Callers such as ``FunctionJobNode.async_execute`` ask for these column
+        names up-front (via ``output_schema(columns={"system_tags": True})`` /
+        ``keys(columns={"system_tags": True})``) before any data has been
+        fetched.  ``_declared_schema_hash`` computes this hash from the schemas
+        declared by ``impl.schema()`` via the shared ``compute_source_schema_hash``
+        helper, so those callers can get the correct column names and Arrow types
+        without triggering a poll+fetch cycle.
+
+        Returns:
+            Hex schema-hash string, or ``None`` if ``impl.schema()`` returned
+            ``None`` (schema not yet known).
+        """
+        if self._tag_schema is None or self._data_schema is None:
+            return None
+        return compute_source_schema_hash(
+            self._tag_schema,
+            self._data_schema,
+            self.data_context,
+            self.orcapod_config,
+        )
+
+    # -------------------------------------------------------------------------
+    # Identity
+    # -------------------------------------------------------------------------
+
+    def identity_structure(self) -> Any:
+        """Identity derived from the impl's own identity and tag columns.
+
+        Delegates to ``impl.identity()`` so that the implementer fully
+        controls what makes two ``PollingSource`` instances distinct.
+        """
+        return (self._impl.identity(), self._tag_columns)
+
+    # -------------------------------------------------------------------------
+    # Sync stream delegation
+    # -------------------------------------------------------------------------
+
+    def output_schema(
+        self,
+        *,
+        columns: ColumnConfig | dict[str, Any] | None = None,
+        all_info: bool = False,
+    ) -> tuple[Schema, Schema]:
+        """Return the output schema.
+
+        Uses three levels of resolution to avoid triggering a poll+fetch cycle:
+
+        1. **Declared-schema fast path** — when ``impl.schema()`` returned a
+           non-``None`` schema at construction (populating ``_tag_schema`` and
+           ``_data_schema``), answers directly from those schemas. System-tag
+           column names and types (``str`` for ``source_id``, ``bytes`` for
+           ``record_id``) are derived from ``_declared_schema_hash`` without
+           any fetch. Applies to all ``ColumnConfig`` flags computable from
+           declared schemas (``system_tags``); flags requiring actual persisted
+           data (``meta``, ``source``, ``context``, ``content_hash``) fall
+           through to the next level.
+        2. **Cached-stream path** — if ``_batches`` is already non-empty (at
+           least one batch fetched via sync or async), delegates to the first
+           batch without triggering a new poll+fetch cycle.
+        3. **Fallback** — calls ``_sync_poll_and_commit()`` then
+           ``_get_combined_stream()``, running a synchronous poll+fetch via
+           ``_run_sync``. Only reached when the impl declared no schema and no
+           batch has been fetched yet.
+        """
+        if self._tag_schema is not None and self._data_schema is not None:
+            columns_config = ColumnConfig.handle_config(columns, all_info=all_info)
+            # meta / source / context / content_hash require actual stream data —
+            # fall through to _batches[0] or _sync_poll_and_commit for those.
+            if not (
+                columns_config.meta
+                or columns_config.source
+                or columns_config.context
+                or columns_config.content_hash
+            ):
+                tag_schema = self._tag_schema
+                if columns_config.system_tags:
+                    # _declared_schema_hash is str | None but is guaranteed non-None
+                    # here because _tag_schema and _data_schema are both non-None.
+                    schema_hash = self._declared_schema_hash
+                    assert schema_hash is not None
+                    src_col, rec_col = system_tag_column_names(schema_hash)
+                    tag_schema = Schema(
+                        {**dict(tag_schema), src_col: str, rec_col: bytes}
+                    )
+                return tag_schema, self._data_schema
+        if self._batches:
+            return self._batches[0].output_schema(columns=columns, all_info=all_info)
+        self._sync_poll_and_commit()
+        return self._get_combined_stream().output_schema(columns=columns, all_info=all_info)
+
+    def keys(
+        self,
+        *,
+        columns: ColumnConfig | dict[str, Any] | None = None,
+        all_info: bool = False,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Return tag and data column keys.
+
+        Uses the same three-level resolution as ``output_schema``: impl-declared
+        schemas → cached ``_batches[0]`` → ``_sync_poll_and_commit()`` fallback.
+        When the impl declared a schema, system-tag column names are derived
+        from ``_declared_schema_hash`` without triggering a fetch.
+        """
+        if self._tag_schema is not None and self._data_schema is not None:
+            columns_config = ColumnConfig.handle_config(columns, all_info=all_info)
+            if not (
+                columns_config.meta
+                or columns_config.source
+                or columns_config.context
+                or columns_config.content_hash
+            ):
+                tag_keys = tuple(self._tag_schema.keys())
+                if columns_config.system_tags:
+                    # _declared_schema_hash is str | None but is guaranteed non-None
+                    # here because _tag_schema and _data_schema are both non-None.
+                    schema_hash = self._declared_schema_hash
+                    assert schema_hash is not None
+                    src_col, rec_col = system_tag_column_names(schema_hash)
+                    tag_keys = tag_keys + (src_col, rec_col)
+                return tag_keys, tuple(self._data_schema.keys())
+        if self._batches:
+            return self._batches[0].keys(columns=columns, all_info=all_info)
+        self._sync_poll_and_commit()
+        return self._get_combined_stream().keys(columns=columns, all_info=all_info)
+
+    def iter_data(self):
+        """Iterate over (tag, data) pairs from the current snapshot."""
+        self._sync_poll_and_commit()
+        return self._get_combined_stream().iter_data()
+
+    def as_table(
+        self,
+        *,
+        columns: ColumnConfig | dict[str, Any] | None = None,
+        all_info: bool = False,
+    ) -> pa.Table:
+        """Return the accumulated rows as a PyArrow table."""
+        self._sync_poll_and_commit()
+        return self._get_combined_stream().as_table(columns=columns, all_info=all_info)
+
+    # -------------------------------------------------------------------------
+    # Serialization
+    # -------------------------------------------------------------------------
+
+    def to_config(self, db_registry: Any = None) -> dict[str, Any]:
+        """Serialize this source to a JSON-compatible config dict.
+
+        Always stores ``impl_module`` and ``impl_class`` so that
+        ``from_config`` can import and reconstruct the impl class —
+        analogous to how ``DataFunction`` serializes its callable. The
+        ``impl_config`` key carries the result of ``impl.to_config()``:
+
+        - Non-``None``: ``from_config`` calls ``impl_class.from_config(impl_config)``.
+        - ``None``: ``from_config`` falls back to ``impl_class()`` (no-arg constructor).
+
+        Args:
+            db_registry: Unused; present for protocol compatibility.
+
+        Returns:
+            A dict suitable for passing to ``from_config``.
+        """
+        impl_type = type(self._impl)
+        return {
+            "source_type": "polling_source",
+            "impl_module": impl_type.__module__,
+            "impl_class": impl_type.__qualname__,
+            "tag_columns": list(self._tag_columns),
+            "polling_config": dataclasses.asdict(self._polling_config),
+            "source_id": self._source_id,
+            "impl_config": self._impl.to_config(),
+        }
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any], db_registry: Any = None) -> PollingSource:
+        """Reconstruct a ``PollingSource`` by importing the impl class.
+
+        When ``config["impl_config"]`` is non-``None``, the impl is
+        reconstructed via ``impl_class.from_config(impl_config)``. Otherwise
+        the impl class is instantiated with no arguments.
+
+        Args:
+            config: A dict as produced by ``to_config``.
+            db_registry: Unused; present for protocol compatibility.
+
+        Returns:
+            A new ``PollingSource`` wrapping the imported impl.
+
+        Raises:
+            KeyError: If ``config`` is missing a required key.
+            ImportError: If the impl module cannot be imported.
+            AttributeError: If the impl class does not exist in the module.
+            TypeError: If the impl class cannot be instantiated.
+        """
+        import importlib
+
+        module = importlib.import_module(config["impl_module"])
+        # Walk dotted qualname to support nested classes (e.g. "Outer.Inner")
+        impl_class: Any = module
+        for part in config["impl_class"].split("."):
+            impl_class = getattr(impl_class, part)
+
+        impl_config = config.get("impl_config")
+        if impl_config is None:
+            impl = impl_class()
+        else:
+            impl = impl_class.from_config(impl_config)
+
+        polling_config = PollingConfig(**config.get("polling_config", {}))
+        return cls(
+            impl=impl,
+            tag_columns=config["tag_columns"],
+            polling_config=polling_config,
+            source_id=config.get("source_id"),
+        )
+
+    # -------------------------------------------------------------------------
+    # Internal sync helpers
+    # -------------------------------------------------------------------------
+
+    def _sync_poll_and_commit(self) -> None:
+        """Poll for new data and commit a new batch under the optimistic lock.
+
+        Implements the check-snapshot → I/O → check-and-commit protocol:
+        reads the cursor snapshot under a brief lock, performs poll and fetch
+        with no lock held, then commits only if the cursor has not changed.
+        If another caller advanced the cursor in between (winning the commit
+        race), this call discards its fetched data — the batch is already in
+        ``_batches`` and will be visible on the next read.
+
+        Safe to call concurrently with ``async_iter_data``.
+        """
+        with self._state_lock:
+            cursor_snapshot = self._cursor
+
+        if cursor_snapshot is None:
+            # First access — no poll needed, fetch unconditionally.
+            logger.debug("PollingSource %r: first sync access — fetching", self._source_id)
+            new_cursor, data = _run_sync(self._impl.fetch, cursor=None)
+            new_stream = self._try_build_stream(data)
+            if new_stream is not None:
+                if self._tag_schema is not None or self._data_schema is not None:
+                    self._validate_against_declared_schemas(new_stream)
+            committed = False
+            with self._state_lock:
+                if self._cursor is None:
+                    if new_stream is not None:
+                        self._batches.append(new_stream)
+                    self._cursor = new_cursor
+                    committed = True
+            if committed:
+                self._update_last_modified_from_cursor(new_cursor)
+        else:
+            has_new = _run_sync(self._impl.poll, cursor=cursor_snapshot)
+            if has_new:
+                logger.debug(
+                    "PollingSource %r: sync poll found new data — fetching", self._source_id
+                )
+                new_cursor, data = _run_sync(self._impl.fetch, cursor=cursor_snapshot)
+                new_stream = self._try_build_stream(data)
+                if new_stream is not None:
+                    if self._tag_schema is not None or self._data_schema is not None:
+                        self._validate_against_declared_schemas(new_stream)
+                    if self._batches:
+                        self._validate_combining_schemas(self._batches[0], new_stream)
+                committed = False
+                with self._state_lock:
+                    if self._cursor == cursor_snapshot:
+                        if new_stream is not None:
+                            self._batches.append(new_stream)
+                        self._cursor = new_cursor
+                        committed = True
+                if committed:
+                    self._update_last_modified_from_cursor(new_cursor)
+            else:
+                logger.debug(
+                    "PollingSource %r: sync poll — cache still valid", self._source_id
+                )
+
+    def _get_combined_stream(self) -> ArrowTableStream:
+        """Return all committed batches concatenated as a single stream.
+
+        Takes a snapshot of ``_batches`` (no lock needed — list is append-only)
+        then combines using the existing ``_combine`` helper.
+
+        Returns:
+            A single ``ArrowTableStream`` containing all rows from all batches.
+
+        Raises:
+            ValueError: If no data has been fetched yet (``_batches`` is empty).
+        """
+        batches = list(self._batches)  # snapshot — safe, list is append-only
+        if not batches:
+            raise ValueError(
+                "PollingSource: no data available yet — first fetch returned empty data."
+            )
+        result = batches[0]
+        for batch in batches[1:]:
+            result = self._combine(result, batch)
+        return result
+
+    def _try_build_stream(self, data: FrameInitTypes) -> ArrowTableStream | None:
+        """Build an ``ArrowTableStream`` from raw data, returning ``None`` for empty data.
+
+        Returns:
+            ``ArrowTableStream`` if data has rows and columns, ``None`` otherwise.
+        """
+        df = pl.DataFrame(data)
+        if len(df.columns) == 0:
+            logger.debug(
+                "PollingSource %r: fetch returned data with no columns — skipping stream build",
+                self._source_id,
+            )
+            return None
+        return self._build_stream_from_df(df)
+
+    def _build_stream_from_df(self, df: pl.DataFrame) -> ArrowTableStream | None:
+        """Build an ``ArrowTableStream`` from a Polars DataFrame.
+
+        Returns ``None`` on the infer-once path when the batch has zero rows and
+        no canonical schema has been established yet — the frame is silently
+        skipped so that a spurious all-non-nullable schema is never recorded.
+        """
+        from orcapod.core.streams.arrow_table_stream import ArrowTableStream
+
+        # Handle Object-dtype columns (same pattern as DataFrameSource)
+        object_columns = [c for c in df.columns if df[c].dtype == pl.Object]
+        if object_columns:
+            sub_table = self.data_context.type_converter.python_dicts_to_arrow_table(
+                df.select(object_columns).to_dicts()
+            )
+            df = df.with_columns([pl.from_arrow(c) for c in sub_table])
+
+        df = polars_data_utils.drop_system_columns(df)
+
+        arrow_table = df.to_arrow()
+
+        # Establish canonical schema on first call; apply it on every call.
+        if self._canonical_arrow_schema is None:
+            if self._tag_schema is not None and self._data_schema is not None:
+                # Declared-schema path: derive Arrow schema from declared Python types.
+                # T | None → nullable=True; plain T → nullable=False. No inference.
+                combined = {**dict(self._tag_schema), **dict(self._data_schema)}
+                self._canonical_arrow_schema = (
+                    self.data_context.type_converter.python_schema_to_arrow_schema(combined)
+                )
+            else:
+                # Infer-once path: first non-empty batch establishes canonical nullability.
+                # Skip zero-row tables: null_count is always 0 for empty tables, so
+                # inference would set every field nullable=False — the original ENG-952 bug.
+                if arrow_table.num_rows > 0:
+                    logger.warning(
+                        "PollingSource %r: no schema declared via impl.schema(); "
+                        "inferring nullability from first batch. Implement impl.schema() "
+                        "to avoid schema drift on zero-row polls or null-free batches.",
+                        self._source_id,
+                    )
+                    self._canonical_arrow_schema = arrow_utils.infer_schema_nullable(arrow_table)
+
+        # If _canonical_arrow_schema is still None here, this is a zero-row frame
+        # on the infer-once path before any real data has arrived.  Skip it —
+        # the caller (_try_build_stream) will return None and the frame is ignored.
+        if self._canonical_arrow_schema is None:
+            return None
+
+        # Apply canonical nullability by column name (order-safe).
+        canonical_nullable = {f.name: f.nullable for f in self._canonical_arrow_schema}
+        target_schema = pa.schema([
+            pa.field(f.name, f.type, nullable=canonical_nullable.get(f.name, f.nullable))
+            for f in arrow_table.schema
+        ])
+        arrow_table = arrow_table.cast(target_schema)
+
+        builder = SourceStreamBuilder(self.data_context, self.orcapod_config)
+        result = builder.build(
+            arrow_table,
+            tag_columns=self._tag_columns,
+            source_id=self._source_id,
+        )
+        return result.stream
+
+    def _validate_against_declared_schemas(self, stream: ArrowTableStream) -> None:
+        """Validate *stream*'s schema against the declared ``_tag_schema`` / ``_data_schema``.
+
+        Called whenever a new batch is fetched and ``impl.schema()`` returned a
+        non-``None`` schema at construction. Raises if the fetched data is
+        incompatible with the declared schema.
+
+        Args:
+            stream: The newly built stream whose schema is to be validated.
+
+        Raises:
+            SchemaInconsistencyError: If the stream's tag or data schema is
+                incompatible with the declared schemas.
+        """
+        actual_tag_schema, actual_data_schema = stream.output_schema()
+        if self._tag_schema is not None:
+            _assert_schema_match("tag", self._tag_schema, actual_tag_schema, self._source_id)
+        if self._data_schema is not None:
+            _assert_schema_match("data", self._data_schema, actual_data_schema, self._source_id)
+
+    def _validate_combining_schemas(
+        self, existing: ArrowTableStream, new_stream: ArrowTableStream
+    ) -> None:
+        """Validate that *new_stream*'s schema is compatible with *existing*.
+
+        Checks that both streams have identical user-facing column sets and
+        that all shared column types match exactly.
+
+        Args:
+            existing: The currently accumulated stream.
+            new_stream: The newly fetched stream to be appended.
+
+        Raises:
+            SchemaInconsistencyError: If column sets differ or any column type has
+                changed between batches.
+        """
+        old_tag_keys, old_data_keys = existing.keys()
+        new_tag_keys, new_data_keys = new_stream.keys()
+
+        old_cols = set(old_tag_keys) | set(old_data_keys)
+        new_cols = set(new_tag_keys) | set(new_data_keys)
+
+        if old_cols != new_cols:
+            added = sorted(new_cols - old_cols)
+            removed = sorted(old_cols - new_cols)
+            raise SchemaInconsistencyError(
+                f"PollingSource {self._source_id!r}: schema mismatch between batches — "
+                f"added: {added!r}, removed: {removed!r}"
+            )
+
+        old_tag_schema, old_data_schema = existing.output_schema()
+        new_tag_schema, new_data_schema = new_stream.output_schema()
+        _assert_schema_match("tag", old_tag_schema, new_tag_schema, self._source_id)
+        _assert_schema_match("data", old_data_schema, new_data_schema, self._source_id)
+
+    def _combine(
+        self, existing: ArrowTableStream, new_stream: ArrowTableStream
+    ) -> ArrowTableStream:
+        """Validate schemas then append *new_stream* rows to *existing*.
+
+        Args:
+            existing: The currently accumulated stream.
+            new_stream: The newly fetched stream to be appended.
+
+        Returns:
+            A new ``ArrowTableStream`` containing rows from both streams.
+
+        Raises:
+            SchemaInconsistencyError: If the schemas are incompatible (see
+                ``_validate_combining_schemas``).
+        """
+        from orcapod.core.streams.arrow_table_stream import ArrowTableStream
+
+        self._validate_combining_schemas(existing, new_stream)
+
+        combined = pa.concat_tables(
+            [
+                existing.as_table(columns=_STREAM_COMBINE_COLUMNS),
+                new_stream.as_table(columns=_STREAM_COMBINE_COLUMNS),
+            ],
+            promote_options="default",
+        )
+        return ArrowTableStream(table=combined, tag_columns=self._tag_columns)
+
+    def _update_last_modified_from_cursor(self, cursor: Cursor[T]) -> None:
+        """Update ``last_modified`` from cursor or fall back to wall clock."""
+        if cursor.modified_at is not None:
+            self._set_modified_time(cursor.modified_at)
+        else:
+            self._update_modified_time()
+
+    # -------------------------------------------------------------------------
+    # Async mode — full polling loop
+    # -------------------------------------------------------------------------
+
+    async def async_iter_data(self):
+        """Async generator that continuously emits (tag, data) pairs.
+
+        Uses a per-iterator ``local_batch_idx`` to track the next position in
+        the append-only ``_batches`` list. A drain step at the top of each
+        loop iteration yields any newly committed batches (including those
+        committed by concurrent sync callers) before sleeping.
+
+        The optimistic lock protocol — snapshot cursor (brief lock) → poll and
+        fetch with no lock held → commit only if cursor unchanged (brief lock)
+        — prevents TOCTOU races without ever holding ``_state_lock`` across an
+        ``await``.
+
+        ``impl.close()`` is always awaited before returning or raising.
+        """
+        # local_batch_idx tracks the next _batches index to yield.
+        # Starting at 0 means the first drain covers any pre-existing batches
+        # (the pre-seed case from the old implementation).
+        local_batch_idx = 0
+
+        cfg = self._polling_config
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+        next_tick = start_time
+        consecutive_misses = 0
+        consecutive_errors = 0
+
+        logger.info(
+            "PollingSource %r starting (interval=%.2fs, duration=%.1fs)",
+            self._source_id,
+            cfg.interval,
+            cfg.duration,
+        )
+
+        try:
+            while True:
+                # ── 1. Drain: yield any batches not yet emitted ──────────────
+                # Covers pre-existing rows on first iteration AND rows committed
+                # by concurrent sync callers while this iterator was polling.
+                while local_batch_idx < len(self._batches):
+                    for item in self._batches[local_batch_idx].iter_data():
+                        yield item
+                    local_batch_idx += 1
+
+                # ── 2. Sleep to next scheduled tick ──────────────────────────
+                now = loop.time()
+                if next_tick > now:
+                    await asyncio.sleep(next_tick - now)
+
+                # ── 3. Poll + fetch + commit (optimistic lock) ───────────────
+                try:
+                    # Brief lock: snapshot cursor only.
+                    with self._state_lock:
+                        cursor_snapshot = self._cursor
+
+                    # Poll — no lock held across await.
+                    has_new = await self._impl.poll(cursor=cursor_snapshot)
+
+                    if has_new:
+                        logger.debug(
+                            "PollingSource %r: new data detected, fetching",
+                            self._source_id,
+                        )
+                        # Fetch — no lock held across await.
+                        new_cursor, data = await self._impl.fetch(cursor=cursor_snapshot)
+                        new_stream = self._try_build_stream(data)
+
+                        if new_stream is not None:
+                            if self._tag_schema is not None or self._data_schema is not None:
+                                self._validate_against_declared_schemas(new_stream)
+                            if self._batches:
+                                self._validate_combining_schemas(
+                                    self._batches[0], new_stream
+                                )
+
+                        # Brief lock: check cursor then commit atomically.
+                        committed = False
+                        with self._state_lock:
+                            if self._cursor == cursor_snapshot:
+                                if new_stream is not None:
+                                    self._batches.append(new_stream)
+                                self._cursor = new_cursor
+                                committed = True
+                            # else: sync caller already advanced cursor —
+                            # their batch is in _batches; drain step above
+                            # will yield it at the top of the next iteration.
+
+                        if committed:
+                            self._update_last_modified_from_cursor(new_cursor)
+                            if logger.isEnabledFor(logging.DEBUG):
+                                emitted_count = (
+                                    new_stream.as_table().num_rows
+                                    if new_stream is not None
+                                    else 0
+                                )
+                                logger.debug(
+                                    "PollingSource %r: committed %d row(s)",
+                                    self._source_id,
+                                    emitted_count,
+                                )
+                    else:
+                        logger.debug(
+                            "PollingSource %r: poll returned no new data",
+                            self._source_id,
+                        )
+
+                    consecutive_errors = 0
+
+                except asyncio.CancelledError:
+                    raise
+
+                except CursorInvalidatedError:
+                    logger.error(
+                        "PollingSource %r: cursor invalidated — previous state cannot "
+                        "be reconciled with already-emitted rows. Terminating source.",
+                        self._source_id,
+                    )
+                    raise
+
+                except InputValidationError:
+                    # Schema mismatches are not transient — propagate immediately.
+                    raise
+
+                except Exception as e:
+                    consecutive_errors += 1
+                    backoff = cfg.error_backoff_base * 2 ** (consecutive_errors - 1)
+                    logger.error(
+                        "PollingSource %r: poll/fetch error (consecutive=%d, "
+                        "backoff=%.1fs): %s",
+                        self._source_id,
+                        consecutive_errors,
+                        backoff,
+                        e,
+                    )
+                    if consecutive_errors >= cfg.max_consecutive_errors:
+                        logger.error(
+                            "PollingSource %r: max consecutive errors (%d) reached. "
+                            "Terminating source.",
+                            self._source_id,
+                            cfg.max_consecutive_errors,
+                        )
+                        break
+                    await asyncio.sleep(backoff)
+                    continue  # retry — do not advance next_tick
+
+                # ── 4. Tick advancement (start-to-start) ─────────────────────
+                now = loop.time()
+                intervals_consumed = floor((now - next_tick) / cfg.interval)
+                if intervals_consumed > 0:
+                    consecutive_misses += intervals_consumed
+                    logger.warning(
+                        "PollingSource %r: tick overrun — consumed %d interval(s) "
+                        "(consecutive_misses=%d/%d)",
+                        self._source_id,
+                        intervals_consumed,
+                        consecutive_misses,
+                        cfg.max_missed_intervals,
+                    )
+                    if consecutive_misses >= cfg.max_missed_intervals:
+                        logger.error(
+                            "PollingSource %r: overrun threshold exceeded. "
+                            "Terminating source.",
+                            self._source_id,
+                        )
+                        break
+                else:
+                    consecutive_misses = 0
+                next_tick += (intervals_consumed + 1) * cfg.interval
+
+                # ── 5. Duration check ─────────────────────────────────────────
+                if cfg.duration > 0 and (loop.time() - start_time) >= cfg.duration:
+                    logger.info(
+                        "PollingSource %r: duration limit (%.1fs) reached. "
+                        "Terminating source.",
+                        self._source_id,
+                        cfg.duration,
+                    )
+                    break
+
+            # ── Final drain ───────────────────────────────────────────────────
+            # Yield any batch committed in the last iteration before a
+            # duration/overrun/max-errors break.  CancelledError and fatal
+            # raises skip this intentionally — their consumers will not read
+            # further items.
+            while local_batch_idx < len(self._batches):
+                for item in self._batches[local_batch_idx].iter_data():
+                    yield item
+                local_batch_idx += 1
+
+        except asyncio.CancelledError:
+            logger.info(
+                "PollingSource %r: cancelled — shutting down cleanly.",
+                self._source_id,
+            )
+
+        finally:
+            logger.debug("PollingSource %r: calling impl.close()", self._source_id)
+            await self._impl.close()
+            logger.info("PollingSource %r: closed.", self._source_id)

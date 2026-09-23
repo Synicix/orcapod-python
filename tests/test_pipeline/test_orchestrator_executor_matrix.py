@@ -20,8 +20,8 @@ restored by PR #99.
 
 Terminology
 -----------
-* "sync orchestrator"  = ``SyncPipelineOrchestrator`` / ``ExecutorType.SYNCHRONOUS``
-* "async orchestrator" = ``AsyncPipelineOrchestrator`` / ``ExecutorType.ASYNC_CHANNELS``
+* "sync orchestrator"  = ``SyncPipelineOrchestrator``
+* "async orchestrator" = ``AsyncPipelineOrchestrator``
 * "sync function"      = regular ``def`` (blocking, runs in executor thread
                          when called from async context)
 * "async function"     = ``async def`` (native coroutine, awaited directly
@@ -41,10 +41,10 @@ from orcapod.core.function_pod import FunctionPod
 from orcapod.core.data_function import PythonDataFunction
 from orcapod.core.sources import ArrowTableSource
 from orcapod.databases import InMemoryArrowDatabase
-from orcapod.pipeline import AsyncPipelineOrchestrator, Pipeline
+from orcapod.pipeline import AsyncPipelineOrchestrator
+from orcapod.pipeline.job import PipelineJob
 from orcapod.pipeline.sync_orchestrator import SyncPipelineOrchestrator
-from orcapod.types import ExecutorType, NodeConfig, PipelineConfig
-
+from orcapod.types import PodConfig
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -72,33 +72,33 @@ def _build_pipeline(
     *,
     n: int = _N_DATA,
     max_concurrency: int | None = 5,
-) -> Pipeline:
-    """Construct an auto-compiled pipeline around *fn*."""
+) -> PipelineJob:
+    """Construct an auto-compiled PipelineJob around *fn*."""
     pf = PythonDataFunction(fn, output_keys="result")
-    pod = FunctionPod(pf, node_config=NodeConfig(max_concurrency=max_concurrency))
+    pod = FunctionPod(pf, pod_config=PodConfig(max_concurrency=max_concurrency))
     db = InMemoryArrowDatabase()
-    pipeline = Pipeline(name="matrix_test", pipeline_database=db, auto_compile=True)
-    with pipeline:
+    job = PipelineJob(name="matrix_test", store=db)
+    with job:
         pod(_make_source(n), label="node")
-    return pipeline
+    return job
 
 
-def _run_sync(pipeline: Pipeline) -> tuple[list[int], float]:
+def _run_sync(job: PipelineJob) -> tuple[list[int], float]:
     """Run with SyncPipelineOrchestrator, return (sorted results, elapsed)."""
     t0 = time.perf_counter()
-    pipeline.run(config=PipelineConfig(executor=ExecutorType.SYNCHRONOUS))
+    job.run(orchestrator=SyncPipelineOrchestrator())
     elapsed = time.perf_counter() - t0
-    records = pipeline.node.get_all_records()
+    records = job.nodes["node"].get_all_records()
     assert records is not None
     return sorted(records.column("result").to_pylist()), elapsed
 
 
-def _run_async(pipeline: Pipeline) -> tuple[list[int], float]:
+def _run_async(job: PipelineJob) -> tuple[list[int], float]:
     """Run with AsyncPipelineOrchestrator, return (sorted results, elapsed)."""
     t0 = time.perf_counter()
-    pipeline.run(config=PipelineConfig(executor=ExecutorType.ASYNC_CHANNELS))
+    job.run(orchestrator=AsyncPipelineOrchestrator())
     elapsed = time.perf_counter() - t0
-    records = pipeline.node.get_all_records()
+    records = job.nodes["node"].get_all_records()
     assert records is not None
     return sorted(records.column("result").to_pylist()), elapsed
 
@@ -119,8 +119,7 @@ async def async_double(x: int) -> int:
 
 def slow_sync_double(x: int) -> int:
     """Sync I/O-bound function: blocks for SLEEP_S seconds."""
-    import time as _time
-    _time.sleep(_SLEEP_S)
+    time.sleep(_SLEEP_S)
     return x * 2
 
 
@@ -157,35 +156,30 @@ class TestSyncOrchestratorSyncFunction:
 
     def test_correctness(self):
         """Sync orchestrator with a sync function produces correct results."""
-        pipeline = _build_pipeline(sync_double)
-        results, _ = _run_sync(pipeline)
+        job = _build_pipeline(sync_double)
+        results, _ = _run_sync(job)
         assert results == _EXPECTED
 
     def test_via_orchestrator_directly(self):
-        """SyncPipelineOrchestrator.run() returns correct results directly."""
+        """SyncPipelineOrchestrator produces correct results via PipelineJob."""
         pf = PythonDataFunction(sync_double, output_keys="result")
         pod = FunctionPod(pf)
-        pipeline = Pipeline(
-            name="direct_orch",
-            pipeline_database=InMemoryArrowDatabase(),
-            auto_compile=True,
-        )
-        with pipeline:
+        db = InMemoryArrowDatabase()
+
+        job = PipelineJob(name="direct_orch", store=db)
+        with job:
             pod(_make_source(), label="node")
 
-        orch = SyncPipelineOrchestrator()
-        result = orch.run(pipeline._node_graph)
-        fn_outputs = [
-            v for k, v in result.node_outputs.items() if k.node_type == "function"
-        ]
-        assert len(fn_outputs) == 1
-        values = sorted(pkt.as_dict()["result"] for _, pkt in fn_outputs[0])
+        job.run(orchestrator=SyncPipelineOrchestrator())
+        records = job.nodes["node"].get_all_records()
+        assert records is not None
+        values = sorted(records.column("result").to_pylist())
         assert values == _EXPECTED
 
     def test_sequential_with_io_bound_work(self):
         """Sync orchestrator processes data sequentially for I/O-bound work."""
-        pipeline = _build_pipeline(slow_sync_double)
-        results, elapsed = _run_sync(pipeline)
+        job = _build_pipeline(slow_sync_double)
+        results, elapsed = _run_sync(job)
         assert results == _EXPECTED
         # 5 data × 0.2 s each must take at least 80 % of serial time
         assert elapsed >= _SEQUENTIAL_MIN, (
@@ -210,14 +204,14 @@ class TestSyncOrchestratorAsyncFunction:
 
     def test_correctness(self):
         """Sync orchestrator with an async function produces correct results."""
-        pipeline = _build_pipeline(async_double)
-        results, _ = _run_sync(pipeline)
+        job = _build_pipeline(async_double)
+        results, _ = _run_sync(job)
         assert results == _EXPECTED
 
     def test_graceful_no_deadlock_with_io_bound(self):
         """Sync orchestrator with a slow async function completes without deadlock."""
-        pipeline = _build_pipeline(slow_async_double)
-        results, elapsed = _run_sync(pipeline)
+        job = _build_pipeline(slow_async_double)
+        results, elapsed = _run_sync(job)
         assert results == _EXPECTED
         # Datas still run sequentially: async_execute is NOT called by the
         # sync orchestrator, so data are bridged one-at-a-time via the
@@ -229,11 +223,11 @@ class TestSyncOrchestratorAsyncFunction:
 
     def test_matches_sync_function_results(self):
         """Sync orch + async fn produces the same values as sync orch + sync fn."""
-        pipeline_sync_fn = _build_pipeline(sync_double)
-        results_sync, _ = _run_sync(pipeline_sync_fn)
+        job_sync_fn = _build_pipeline(sync_double)
+        results_sync, _ = _run_sync(job_sync_fn)
 
-        pipeline_async_fn = _build_pipeline(async_double)
-        results_async, _ = _run_sync(pipeline_async_fn)
+        job_async_fn = _build_pipeline(async_double)
+        results_async, _ = _run_sync(job_async_fn)
 
         assert results_sync == results_async == _EXPECTED
 
@@ -254,14 +248,14 @@ class TestAsyncOrchestratorSyncFunction:
 
     def test_correctness(self):
         """Async orchestrator with a sync function produces correct results."""
-        pipeline = _build_pipeline(sync_double)
-        results, _ = _run_async(pipeline)
+        job = _build_pipeline(sync_double)
+        results, _ = _run_async(job)
         assert results == _EXPECTED
 
     def test_concurrent_with_io_bound_work(self):
         """Async orch + sync function shows concurrency via thread-pool execution."""
-        pipeline = _build_pipeline(slow_sync_double, max_concurrency=5)
-        results, elapsed = _run_async(pipeline)
+        job = _build_pipeline(slow_sync_double, max_concurrency=5)
+        results, elapsed = _run_async(job)
         assert results == _EXPECTED
         # Should complete well under serial time thanks to run_in_executor
         assert elapsed < _CONCURRENT_MAX, (
@@ -296,14 +290,14 @@ class TestAsyncOrchestratorAsyncFunction:
 
     def test_correctness(self):
         """Async orchestrator with an async function produces correct results."""
-        pipeline = _build_pipeline(async_double)
-        results, _ = _run_async(pipeline)
+        job = _build_pipeline(async_double)
+        results, _ = _run_async(job)
         assert results == _EXPECTED
 
     def test_concurrent_with_io_bound_work(self):
         """Async orch + async fn completes I/O-bound workload concurrently."""
-        pipeline = _build_pipeline(slow_async_double, max_concurrency=5)
-        results, elapsed = _run_async(pipeline)
+        job = _build_pipeline(slow_async_double, max_concurrency=5)
+        results, elapsed = _run_async(job)
         assert results == _EXPECTED
         assert elapsed < _CONCURRENT_MAX, (
             f"Expected concurrent execution (< {_CONCURRENT_MAX:.2f}s) "
@@ -312,8 +306,8 @@ class TestAsyncOrchestratorAsyncFunction:
 
     def test_concurrency_limiting_respected(self):
         """max_concurrency=1 forces sequential execution even with async fn."""
-        pipeline = _build_pipeline(slow_async_double, max_concurrency=1)
-        results, elapsed = _run_async(pipeline)
+        job = _build_pipeline(slow_async_double, max_concurrency=1)
+        results, elapsed = _run_async(job)
         assert results == _EXPECTED
         assert elapsed >= _SEQUENTIAL_MIN, (
             f"max_concurrency=1 should force sequential execution "
@@ -373,8 +367,8 @@ class TestConcurrencyBenefitAcrossMatrix:
 
     def test_unlimited_concurrency_no_deadlock(self):
         """max_concurrency=None (unlimited) should not deadlock."""
-        pipeline = _build_pipeline(slow_async_double, max_concurrency=None)
-        results, elapsed = _run_async(pipeline)
+        job = _build_pipeline(slow_async_double, max_concurrency=None)
+        results, elapsed = _run_async(job)
         assert results == _EXPECTED
         # Should run all data concurrently with no semaphore overhead
         assert elapsed < _CONCURRENT_MAX, (
@@ -418,6 +412,34 @@ async def _cooperative_fn(x: int) -> int:
     """
     await asyncio.sleep(_SINGLE_SLEEP_S)
     return x * 2
+
+
+async def _run_async_with_limited_pool(
+    job: PipelineJob, pool_workers: int
+) -> tuple[list[int], float]:
+    """Run PipelineJob async on an event loop whose thread pool is capped.
+
+    Temporarily installs a ``ThreadPoolExecutor`` with *pool_workers* threads
+    as the running loop's default executor, ensuring the sync path cannot
+    exceed that concurrency even if the machine has many CPUs.
+    """
+    loop = asyncio.get_running_loop()
+    limited_pool = ThreadPoolExecutor(max_workers=pool_workers)
+    loop.set_default_executor(limited_pool)
+    # asyncio.run() creates a fresh loop each call, so no need to restore.
+    t0 = time.perf_counter()
+    await AsyncPipelineOrchestrator().run_async(job.dag)
+    elapsed = time.perf_counter() - t0
+    limited_pool.shutdown(wait=False)
+
+    # Flush pending database writes (PipelineJob.run() does this internally,
+    # but here we call the orchestrator directly).
+    assert job.store is not None
+    job.store.at(*job.name).flush()
+
+    records = job.nodes["node"].get_all_records()
+    assert records is not None
+    return sorted(records.column("result").to_pylist()), elapsed
 
 
 class TestAsyncOrchestratorFunctionTypeDifference:
@@ -489,30 +511,6 @@ async def _coro_sleep_double(x: int) -> int:
     return x * 2
 
 
-async def _run_async_with_limited_pool(
-    pipeline: Pipeline, pool_workers: int
-) -> tuple[list[int], float]:
-    """Run pipeline async on an event loop whose thread pool is capped.
-
-    Temporarily installs a ``ThreadPoolExecutor`` with *pool_workers* threads
-    as the running loop's default executor, ensuring the sync path cannot
-    exceed that concurrency even if the machine has many CPUs.
-    """
-    loop = asyncio.get_running_loop()
-    limited_pool = ThreadPoolExecutor(max_workers=pool_workers)
-    loop.set_default_executor(limited_pool)
-    # asyncio.run() creates a fresh loop each call, so no need to restore.
-    t0 = time.perf_counter()
-    await AsyncPipelineOrchestrator().run_async(pipeline._node_graph)
-    elapsed = time.perf_counter() - t0
-    limited_pool.shutdown(wait=False)
-
-    pipeline.flush()
-    records = pipeline.node.get_all_records()
-    assert records is not None
-    return sorted(records.column("result").to_pylist()), elapsed
-
-
 class TestAsyncAsyncVsAsyncSync:
     """Verify that async+async outperforms async+sync when the thread pool
     is smaller than the number of concurrent data.
@@ -563,3 +561,31 @@ class TestAsyncAsyncVsAsyncSync:
             f"async+async ({elapsed_async:.2f}s) should be >40% faster than "
             f"async+sync ({elapsed_sync:.2f}s) under pool saturation"
         )
+
+
+# ===========================================================================
+# PipelineJob-based correctness test (ENG-491 track)
+# ===========================================================================
+
+
+class TestSyncOrchestratorSyncFunctionPipelineJob:
+    """Cell (1) correctness re-validated with the PipelineJob API (ENG-491 track)."""
+
+    def test_correctness_via_pipeline_job(self):
+        """Sync orchestrator + sync function produces correct results via PipelineJob."""
+        pf = PythonDataFunction(sync_double, output_keys="result")
+        pod = FunctionPod(pf)
+        db = InMemoryArrowDatabase()
+
+        job = PipelineJob(name="matrix_pj", store=db)
+        with job:
+            pod(_make_source(), label="node")
+
+        job.run()
+
+        fn_node = job.nodes.get("node")
+        assert fn_node is not None
+        records = fn_node.get_all_records()
+        assert records is not None
+        values = sorted(records.column("result").to_pylist())
+        assert values == _EXPECTED

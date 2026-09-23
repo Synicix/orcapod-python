@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from collections.abc import Iterator, Mapping
 from typing import (
     TYPE_CHECKING,
@@ -13,7 +14,7 @@ from orcapod.protocols.hashing_protocols import (
     ContentIdentifiableProtocol,
     DataContextAwareProtocol,
 )
-from orcapod.types import ColumnConfig, DataValue, Schema
+from orcapod.types import ColumnConfig, DataValue, Schema, SourceInfoValue
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -47,12 +48,12 @@ class DatagramProtocol(ContentIdentifiableProtocol, DataContextAwareProtocol, Pr
     """
 
     @property
-    def datagram_id(self) -> str:
+    def datagram_uuid(self) -> uuid.UUID:
         """
-        Return the UUID of this datagram.
+        Return the UUID of this datagram (UUID v7).
 
         Returns:
-            UUID: The unique identifier for this instance of datagram.
+            uuid.UUID: The UUID for this datagram instance.
         """
         ...
 
@@ -651,7 +652,7 @@ class DataProtocol(DatagramProtocol, Protocol):
     data flow: Tags provide context, Datas provide content.
     """
 
-    def source_info(self) -> dict[str, str | None]:
+    def source_info(self) -> dict[str, SourceInfoValue]:
         """
         Return metadata about the data's source/origin.
 
@@ -663,13 +664,15 @@ class DataProtocol(DatagramProtocol, Protocol):
         - Processing pipeline information
 
         Returns:
-            dict[str, str | None]: Source information for each data column as key-value pairs.
+            dict[str, SourceInfoValue]: Source information for each data column as
+            key-value pairs.  A value is a provenance token string, ``None`` when
+            unknown, or a list of tokens for many-to-one operators.
         """
         ...
 
     def with_source_info(
         self,
-        **source_info: str | None,
+        **source_info: SourceInfoValue,
     ) -> Self:
         """
         Create a new data with updated source information.

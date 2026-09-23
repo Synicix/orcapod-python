@@ -98,13 +98,13 @@ class TestEmptyTable:
     PATH = ("source", "v1")
 
     def test_get_record_by_id_returns_none_when_empty(self, db):
-        assert db.get_record_by_id(self.PATH, "id-1", flush=True) is None
+        assert db.get_record_by_id(self.PATH, b"id-1", flush=True) is None
 
     def test_get_all_records_returns_none_when_empty(self, db):
         assert db.get_all_records(self.PATH) is None
 
     def test_get_records_by_ids_returns_none_when_empty(self, db):
-        assert db.get_records_by_ids(self.PATH, ["id-1"], flush=True) is None
+        assert db.get_records_by_ids(self.PATH, [b"id-1"], flush=True) is None
 
     def test_get_records_with_column_value_returns_none_when_empty(self, db):
         assert (
@@ -123,42 +123,42 @@ class TestAddRecordRoundTrip:
 
     def test_added_record_retrievable_from_pending(self, db):
         record = make_table(value=[42])
-        db.add_record(self.PATH, "id-1", record)
-        result = db.get_record_by_id(self.PATH, "id-1")
+        db.add_record(self.PATH, b"id-1", record)
+        result = db.get_record_by_id(self.PATH, b"id-1")
         assert result is not None
         assert result.column("value").to_pylist() == [42]
 
     def test_added_record_retrievable_after_flush(self, db):
         record = make_table(value=[99])
-        db.add_record(self.PATH, "id-2", record)
+        db.add_record(self.PATH, b"id-2", record)
         db.flush()
-        result = db.get_record_by_id(self.PATH, "id-2", flush=True)
+        result = db.get_record_by_id(self.PATH, b"id-2", flush=True)
         assert result is not None
         assert result.column("value").to_pylist() == [99]
 
     def test_record_id_column_not_in_result_by_default(self, db):
         record = make_table(value=[1])
-        db.add_record(self.PATH, "id-3", record)
-        result = db.get_record_by_id(self.PATH, "id-3")
+        db.add_record(self.PATH, b"id-3", record)
+        result = db.get_record_by_id(self.PATH, b"id-3")
         assert result is not None
         assert DeltaTableDatabase.RECORD_ID_COLUMN not in result.column_names
 
     def test_record_id_column_exposed_when_requested(self, db):
         record = make_table(value=[1])
-        db.add_record(self.PATH, "id-4", record)
+        db.add_record(self.PATH, b"id-4", record)
         db.flush()
         result = db.get_record_by_id(
-            self.PATH, "id-4", record_id_column="my_id", flush=True
+            self.PATH, b"id-4", record_id_column="my_id", flush=True
         )
         assert result is not None
         assert "my_id" in result.column_names
-        assert result.column("my_id").to_pylist() == ["id-4"]
+        assert result.column("my_id").to_pylist() == [b"id-4"]
 
     def test_unknown_record_returns_none(self, db):
         record = make_table(value=[1])
-        db.add_record(self.PATH, "id-5", record)
+        db.add_record(self.PATH, b"id-5", record)
         db.flush()
-        assert db.get_record_by_id(self.PATH, "nonexistent", flush=True) is None
+        assert db.get_record_by_id(self.PATH, b"nonexistent", flush=True) is None
 
 
 # ---------------------------------------------------------------------------
@@ -204,14 +204,14 @@ class TestDuplicateHandling:
 
     def test_skip_duplicates_true_does_not_raise(self, db):
         record = make_table(value=[1])
-        db.add_record(self.PATH, "dup-id", record)
+        db.add_record(self.PATH, b"dup-id", record)
         db.flush()
         # same id again — should silently skip
-        db.add_record(self.PATH, "dup-id", make_table(value=[2]), skip_duplicates=True)
+        db.add_record(self.PATH, b"dup-id", make_table(value=[2]), skip_duplicates=True)
 
     def test_skip_duplicates_false_raises_on_pending_duplicate(self, db):
         record = make_table(value=[1])
-        db.add_record(self.PATH, "dup-id2", record)
+        db.add_record(self.PATH, b"dup-id2", record)
         with pytest.raises(ValueError):
             db.add_records(
                 self.PATH,
@@ -240,19 +240,19 @@ class TestGetRecordsByIds:
     PATH = ("byids", "v1")
 
     def _populate(self, db):
-        records = make_table(__record_id=["a", "b", "c"], value=[10, 20, 30])
+        records = make_table(__record_id=[b"a", b"b", b"c"], value=[10, 20, 30])
         db.add_records(self.PATH, records, record_id_column="__record_id")
         db.flush()
 
     def test_retrieves_subset(self, db):
         self._populate(db)
-        result = db.get_records_by_ids(self.PATH, ["a", "c"], flush=True)
+        result = db.get_records_by_ids(self.PATH, [b"a", b"c"], flush=True)
         assert result is not None
         assert result.num_rows == 2
 
     def test_returns_none_for_missing_ids(self, db):
         self._populate(db)
-        result = db.get_records_by_ids(self.PATH, ["z"], flush=True)
+        result = db.get_records_by_ids(self.PATH, [b"z"], flush=True)
         assert result is None
 
     def test_empty_id_list_returns_none(self, db):
@@ -310,30 +310,30 @@ class TestHierarchicalPath:
     def test_deep_path_stores_and_retrieves(self, db):
         path = ("org", "project", "dataset", "v1")
         record = make_table(x=[7])
-        db.add_record(path, "deep-id", record)
+        db.add_record(path, b"deep-id", record)
         db.flush()
-        result = db.get_record_by_id(path, "deep-id", flush=True)
+        result = db.get_record_by_id(path, b"deep-id", flush=True)
         assert result is not None
         assert result.column("x").to_pylist() == [7]
 
     def test_different_paths_are_independent(self, db):
         path_a = ("ns", "a")
         path_b = ("ns", "b")
-        db.add_record(path_a, "id-1", make_table(v=[1]))
-        db.add_record(path_b, "id-1", make_table(v=[2]))
+        db.add_record(path_a, b"id-1", make_table(v=[1]))
+        db.add_record(path_b, b"id-1", make_table(v=[2]))
         db.flush()
-        result_a = db.get_record_by_id(path_a, "id-1", flush=True)
-        result_b = db.get_record_by_id(path_b, "id-1", flush=True)
+        result_a = db.get_record_by_id(path_a, b"id-1", flush=True)
+        result_b = db.get_record_by_id(path_b, b"id-1", flush=True)
         assert result_a.column("v").to_pylist() == [1]
         assert result_b.column("v").to_pylist() == [2]
 
     def test_invalid_empty_path_raises(self, db):
         with pytest.raises(ValueError):
-            db.add_record((), "id-1", make_table(v=[1]))
+            db.add_record((), b"id-1", make_table(v=[1]))
 
     def test_path_with_unsafe_characters_raises(self, db):
         with pytest.raises(ValueError):
-            db.add_record(("bad/path",), "id-1", make_table(v=[1]))
+            db.add_record(("bad/path",), b"id-1", make_table(v=[1]))
 
 
 # ---------------------------------------------------------------------------
@@ -345,8 +345,8 @@ class TestFlushBehaviour:
     PATH = ("flush", "v1")
 
     def test_flush_writes_pending_to_delta(self, db):
-        db.add_record(self.PATH, "f1", make_table(v=[1]))
-        db.add_record(self.PATH, "f2", make_table(v=[2]))
+        db.add_record(self.PATH, b"f1", make_table(v=[1]))
+        db.add_record(self.PATH, b"f2", make_table(v=[2]))
         assert "flush/v1" in db._pending_batches  # records are buffered
         db.flush()
         assert "flush/v1" not in db._pending_batches  # pending cleared after flush
@@ -355,9 +355,9 @@ class TestFlushBehaviour:
         assert result.num_rows == 2
 
     def test_multiple_flushes_accumulate_records(self, db):
-        db.add_record(self.PATH, "m1", make_table(v=[10]))
+        db.add_record(self.PATH, b"m1", make_table(v=[10]))
         db.flush()
-        db.add_record(self.PATH, "m2", make_table(v=[20]))
+        db.add_record(self.PATH, b"m2", make_table(v=[20]))
         db.flush()
         result = db.get_all_records(self.PATH, retrieve_pending=False)
         assert result is not None
@@ -371,8 +371,8 @@ class TestFlushBehaviour:
 
 def test_list_sources(tmp_path):
     db = DeltaTableDatabase(tmp_path)
-    db.add_record(("alpha",), "r1", make_table(v=[1]), flush=True)
-    db.add_record(("beta", "sub"), "r1", make_table(v=[2]), flush=True)
+    db.add_record(("alpha",), b"r1", make_table(v=[1]), flush=True)
+    db.add_record(("beta", "sub"), b"r1", make_table(v=[2]), flush=True)
 
     sources = db.list_sources()
     assert ("alpha",) in sources
@@ -384,17 +384,17 @@ def test_upath_local_accepted(tmp_path):
     from upath import UPath
 
     db = DeltaTableDatabase(UPath(tmp_path))
-    db.add_record(("src",), "r1", make_table(v=[1]), flush=True)
-    result = db.get_record_by_id(("src",), "r1")
+    db.add_record(("src",), b"r1", make_table(v=[1]), flush=True)
+    result = db.get_record_by_id(("src",), b"r1")
     assert result is not None
 
 
 def test_schema_evolution(tmp_path):
     db = DeltaTableDatabase(tmp_path, allow_schema_evolution=True)
-    db.add_record(("src",), "r1", make_table(a=[1]), flush=True)
+    db.add_record(("src",), b"r1", make_table(a=[1]), flush=True)
     db.add_record(
         ("src",),
-        "r2",
+        b"r2",
         make_table(a=[2], b=["new-col"]),
         schema_handling="merge",
         flush=True,
@@ -429,19 +429,19 @@ class TestAtMethod:
     def test_writes_through_scoped_view_readable_from_same_view(self, db):
         scoped = db.at("pipeline", "node1")
         record = make_table(value=[42])
-        scoped.add_record(("outputs",), "id1", record, flush=True)
-        result = scoped.get_record_by_id(("outputs",), "id1", flush=True)
+        scoped.add_record(("outputs",), b"id1", record, flush=True)
+        result = scoped.get_record_by_id(("outputs",), b"id1", flush=True)
         assert result is not None
         assert result.column("value").to_pylist() == [42]
 
     def test_scoped_write_not_visible_via_parent_at_same_path(self, db):
         scoped = db.at("pipeline", "node1")
-        scoped.add_record(("outputs",), "id1", make_table(value=[42]), flush=True)
-        assert db.get_record_by_id(("outputs",), "id1") is None
+        scoped.add_record(("outputs",), b"id1", make_table(value=[42]), flush=True)
+        assert db.get_record_by_id(("outputs",), b"id1") is None
 
     def test_scoped_write_stored_under_correct_filesystem_path(self, db, tmp_path):
         scoped = db.at("pipeline", "node1")
-        scoped.add_record(("outputs",), "id1", make_table(value=[1]), flush=True)
+        scoped.add_record(("outputs",), b"id1", make_table(value=[1]), flush=True)
         # Delta table should be at <tmp_path>/db/pipeline/node1/outputs/
         expected_path = tmp_path / "db" / "pipeline" / "node1" / "outputs"
         assert expected_path.exists()
@@ -450,16 +450,16 @@ class TestAtMethod:
         db = DeltaTableDatabase(base_path=tmp_path / "db", max_hierarchy_depth=10)
         scoped = db.at("a", "b", "c", "d", "e", "f", "g", "h", "i")  # 9 prefix
         # 9 + 1 = 10: OK
-        scoped.add_record(("z",), "id1", make_table(value=[1]))
+        scoped.add_record(("z",), b"id1", make_table(value=[1]))
         # 9 + 2 = 11: should raise
         with pytest.raises(ValueError):
-            scoped.add_record(("z", "extra"), "id2", make_table(value=[2]))
+            scoped.add_record(("z", "extra"), b"id2", make_table(value=[2]))
 
     def test_list_sources_on_scoped_instance(self, tmp_path):
         db = DeltaTableDatabase(base_path=tmp_path / "db")
         scoped = db.at("pipeline")
-        scoped.add_record(("node1",), "id1", make_table(value=[1]), flush=True)
-        scoped.add_record(("node2",), "id2", make_table(value=[2]), flush=True)
+        scoped.add_record(("node1",), b"id1", make_table(value=[1]), flush=True)
+        scoped.add_record(("node2",), b"id2", make_table(value=[2]), flush=True)
         sources = scoped.list_sources()
         assert ("node1",) in sources
         assert ("node2",) in sources
@@ -483,3 +483,134 @@ class TestAtMethod:
     def test_at_rejects_non_str_component(self, db):
         with pytest.raises(TypeError):
             db.at(42)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# string_view columns (ENG-601)
+# ---------------------------------------------------------------------------
+
+
+def make_string_view_table(**columns: list) -> pa.Table:
+    """Build a table where every all-string column is physically ``string_view``.
+
+    Mirrors what ``polars.DataFrame.to_arrow(compat_level=newest)`` (newer polars,
+    e.g. on Ray workers) produces, which PyArrow has no comparison kernels for.
+    """
+    fields = []
+    arrays = []
+    for name, values in columns.items():
+        if values and all(isinstance(v, str) for v in values):
+            arrays.append(pa.array(values, type=pa.string_view()))
+            fields.append(pa.field(name, pa.string_view()))
+        else:
+            arr = pa.array(values)
+            arrays.append(arr)
+            fields.append(pa.field(name, arr.type))
+    return pa.table(arrays, schema=pa.schema(fields))
+
+
+class TestStringViewColumns:
+    """Regression for ENG-601.
+
+    PyArrow (both 23.x and 24.x) has no comparison kernels for ``string_view``,
+    so filtering/sorting a stored Delta table whose columns are physically
+    ``string_view`` raised ``ArrowNotImplementedError``. Reads must tolerate
+    pre-existing ``string_view`` data; writes must not persist ``string_view``.
+    """
+
+    PATH = ("sv", "v1")
+
+    def test_lookup_on_preexisting_string_view_table(self, db):
+        # Simulate data already persisted with string_view columns (e.g. written
+        # by a worker running a newer polars). Write straight to the table URI so
+        # we exercise the read path against on-disk string_view data.
+        import deltalake
+
+        uri = db._get_table_uri(self.PATH)
+        tbl = make_string_view_table(
+            __record_id=["p", "q", "r"], category=["A", "B", "A"]
+        )
+        assert tbl.schema.field("category").type == pa.string_view()
+        deltalake.write_deltalake(uri, tbl, mode="overwrite")
+
+        result = db.get_records_with_column_value(
+            self.PATH, {"category": "A"}, flush=True
+        )
+        assert result is not None
+        assert result.num_rows == 2
+
+    def test_get_all_records_on_preexisting_string_view_table(self, db):
+        import deltalake
+
+        uri = db._get_table_uri(self.PATH)
+        tbl = make_string_view_table(__record_id=["p", "q"], category=["A", "B"])
+        deltalake.write_deltalake(uri, tbl, mode="overwrite")
+
+        result = db.get_all_records(self.PATH)
+        assert result is not None
+        assert result.num_rows == 2
+        # Read path normalizes away string_view.
+        assert not any(pa.types.is_string_view(f.type) for f in result.schema)
+
+    def test_read_delta_table_no_filter_normalizes_views(self, db):
+        # The unfiltered read path must also drop string_view (protects callers
+        # that sort/compare the result).
+        import deltalake
+
+        uri = db._get_table_uri(self.PATH)
+        tbl = make_string_view_table(__record_id=["p", "q"], category=["A", "B"])
+        deltalake.write_deltalake(uri, tbl, mode="overwrite")
+
+        result = db._read_delta_table(db._get_delta_table(self.PATH))
+        assert result.num_rows == 2
+        assert not any(pa.types.is_string_view(f.type) for f in result.schema)
+
+    def test_add_records_does_not_persist_string_view(self, db):
+        import glob
+        import os
+
+        import pyarrow.parquet as pq
+
+        tbl = make_string_view_table(__record_id=["p", "q"], category=["A", "B"])
+        db.add_records(self.PATH, tbl, record_id_column="__record_id", flush=True)
+
+        # Inspect the physical parquet (bypasses read-side normalization).
+        uri = db._get_table_uri(self.PATH)
+        files = glob.glob(os.path.join(uri, "*.parquet"))
+        assert files
+        for f in files:
+            schema = pq.read_schema(f)
+            assert not any(
+                pa.types.is_string_view(field.type) for field in schema
+            ), f"string_view persisted in {f}"
+
+
+# ---------------------------------------------------------------------------
+# N. table_exists
+# ---------------------------------------------------------------------------
+
+
+class TestTableExists:
+    def test_returns_false_when_path_absent(self, db):
+        assert db.table_exists(("no", "table", "here")) is False
+
+    def test_returns_true_after_write_and_flush(self, db):
+        record = make_table(val=[1])
+        db.add_record(("mypath",), b"id1", record)
+        db.flush()
+        assert db.table_exists(("mypath",)) is True
+
+    def test_returns_false_for_different_path(self, db):
+        record = make_table(val=[1])
+        db.add_record(("path_a",), b"id1", record)
+        db.flush()
+        assert db.table_exists(("path_b",)) is False
+
+    def test_scoped_db_sees_correct_path(self, db):
+        scoped = db.at("scope")
+        record = make_table(val=[1])
+        scoped.add_record(("sub",), b"id1", record)
+        scoped.flush()
+        assert scoped.table_exists(("sub",)) is True
+        assert db.table_exists(("scope", "sub")) is True
+        assert db.table_exists(("sub",)) is False

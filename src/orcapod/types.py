@@ -16,9 +16,10 @@ import os
 import uuid
 from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import date, datetime
 from enum import Enum
 from types import UnionType
-from typing import TYPE_CHECKING, Any, Self, TypeAlias
+from typing import TYPE_CHECKING, Any, Generic, Self, TypeAlias, TypeVar
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -41,20 +42,24 @@ PathLike: TypeAlias = str | os.PathLike
 """Convenience alias for any filesystem-path-like object (``str`` or
 ``os.PathLike``)."""
 
-# TODO: accomodate other common data types such as datetime
-TagValue: TypeAlias = int | str | None | Collection["TagValue"]
-"""A tag metadata value: an int, string, ``None``, or an arbitrarily nested
-collection thereof. Tags are used to label and organise data and
-datagrams."""
+TagValue: TypeAlias = int | str | date | datetime | None | Collection["TagValue"]
+"""A tag metadata value: an int, string, date, datetime, ``None``, or an
+arbitrarily nested collection thereof. Tags are used to label and organise
+data and datagrams."""
+
+SourceInfoValue: TypeAlias = str | None | list["SourceInfoValue"]
+"""A per-column provenance token: a string, ``None`` when the provenance is
+unknown, or -- for many-to-one operators such as ``GroupBy`` and
+``MergeJoin`` -- a list of tokens, one per aggregated member."""
 
 PathSet: TypeAlias = PathLike | Collection[PathLike | None]
 """A single path or an arbitrarily nested collection of paths (with optional
 ``None`` entries). Used when operations need to address multiple files at
 once, e.g. batch hashing."""
 
-SupportedNativePythonData: TypeAlias = str | int | float | bool | bytes
+SupportedNativePythonData: TypeAlias = str | int | float | bool | bytes | date | datetime
 """The simple Python scalar types that have a direct Arrow / Polars
-correspondence."""
+correspondence, including temporal types (date and datetime)."""
 
 ExtendedSupportedPythonData: TypeAlias = SupportedNativePythonData | PathSet
 """Native scalar types extended with filesystem paths."""
@@ -71,6 +76,7 @@ SchemaLike: TypeAlias = Mapping[str, DataType]
 """A dict-like structure mapping field names to ``DataType`` entries.
 Accepted wherever a ``Schema`` is expected so callers can pass plain dicts."""
 
+_T = TypeVar("_T")
 
 class Schema(Mapping[str, DataType]):
     """Immutable schema representing a mapping of field names to Python types.
@@ -179,6 +185,25 @@ class Schema(Mapping[str, DataType]):
             {**self._data, **other}, optional_fields=self._optional | other_optional
         )
 
+    def __add__(self, other: object) -> Self:
+        """Concatenate two schemas, delegating to ``merge()``.
+
+        Args:
+            other: Another ``Schema`` to merge with this one.
+
+        Returns:
+            A new ``Schema`` containing all fields from both schemas.
+
+        Raises:
+            ValueError: If any shared field has a different type in ``other``.
+            NotImplementedError: If ``other`` is not a ``Schema``.
+        """
+        if isinstance(other, Schema):
+            return self.merge(other)
+        raise NotImplementedError(
+            f"Adding {Schema} to {type(other)} is not supported"
+        )
+
     def with_values(self, other: dict[str, type] | None, **kwargs: type) -> Schema:
         """Return a new Schema with the specified fields added or overridden.
 
@@ -268,14 +293,20 @@ class Schema(Mapping[str, DataType]):
         return cls({})
 
 
-class ExecutorType(Enum):
-    """Pipeline execution strategy.
+class OrchestratorType(Enum):
+    """Pipeline orchestrator selection.
 
     Attributes:
-        SYNCHRONOUS: Current behavior -- ``static_process`` chain with
-            pull-based materialization.
+        SYNCHRONOUS: Pull-based synchronous DAG walk via
+            ``SyncPipelineOrchestrator``.
         ASYNC_CHANNELS: Push-based async channel execution via
-            ``async_execute``.
+            ``AsyncPipelineOrchestrator``.
+
+    Note:
+        This is distinct from ``DataFunction.executor``, which controls
+        distributed execution of individual data functions (e.g. Ray).
+        ``OrchestratorType`` selects the pipeline-level coordination
+        strategy only.
     """
 
     SYNCHRONOUS = "synchronous"
@@ -287,7 +318,7 @@ class PipelineConfig:
     """Pipeline-level execution configuration.
 
     Attributes:
-        executor: Which execution strategy to use.
+        orchestrator: Which orchestrator strategy to use.
         channel_buffer_size: Max items buffered per channel edge.
         default_max_concurrency: Pipeline-wide default for per-node
             concurrency.  ``None`` means unlimited.
@@ -298,7 +329,7 @@ class PipelineConfig:
             via ``with_options()`` (e.g. ``{"num_cpus": 4}``).
     """
 
-    executor: ExecutorType = ExecutorType.SYNCHRONOUS
+    orchestrator: OrchestratorType = OrchestratorType.SYNCHRONOUS
     channel_buffer_size: int = 64
     default_max_concurrency: int | None = None
     execution_engine: DataFunctionExecutorProtocol | None = None
@@ -306,11 +337,11 @@ class PipelineConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class NodeConfig:
-    """Per-node execution configuration.
+class PodConfig:
+    """Per-pod executor configuration.
 
     Attributes:
-        max_concurrency: Override for this node's concurrency limit.
+        max_concurrency: Maximum concurrent function invocations for this pod.
             ``None`` inherits from ``PipelineConfig.default_max_concurrency``.
             ``1`` means sequential (rate-limited APIs, preserves ordering).
     """
@@ -318,10 +349,64 @@ class NodeConfig:
     max_concurrency: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class NodeConfig:
+    """Per-node pipeline execution configuration.
+
+    Attributes:
+        is_result_ephemeral: ``None`` inherits the default (``False``).
+            ``True`` writes new computation results to the pipeline-scoped
+            ephemeral store instead of the persistent result database.
+            Persistent cache hits are still served when available. Raises
+            ``RuntimeError`` at execution time if ``True`` but no ephemeral
+            store has been injected via ``set_ephemeral_store()``.
+        ignore_schema: Tuple of schema version strings that this node will
+            tolerate without raising ``SchemaVersionError``. ``None`` (default)
+            means no old schema is tolerated — any detected v0 table raises
+            ``SchemaVersionError``. Pass ``("v0",)`` to suppress the error
+            and allow the node to recompute all results from scratch.
+    """
+
+    is_result_ephemeral: bool | None = None
+    ignore_schema: tuple[str, ...] | None = None
+
+    def merge(self, other: "NodeConfig") -> "NodeConfig":
+        """Return a new ``NodeConfig`` with ``other``'s non-``None`` fields overriding self.
+
+        ``None`` fields in ``other`` are treated as "not set" and leave
+        self's value unchanged.
+
+        Args:
+            other: The ``NodeConfig`` whose non-``None`` fields take precedence.
+
+        Returns:
+            A new immutable ``NodeConfig``.
+
+        Example:
+            NodeConfig(is_result_ephemeral=True).merge(NodeConfig())
+            # → NodeConfig(is_result_ephemeral=True)
+
+            NodeConfig(is_result_ephemeral=True).merge(NodeConfig(is_result_ephemeral=False))
+            # → NodeConfig(is_result_ephemeral=False)
+        """
+        return NodeConfig(
+            is_result_ephemeral=(
+                other.is_result_ephemeral
+                if other.is_result_ephemeral is not None
+                else self.is_result_ephemeral
+            ),
+            ignore_schema=(
+                other.ignore_schema
+                if other.ignore_schema is not None
+                else self.ignore_schema
+            ),
+        )
+
+
 def resolve_concurrency(
-    node_config: NodeConfig, pipeline_config: PipelineConfig
+    pod_config: PodConfig, pipeline_config: PipelineConfig
 ) -> int | None:
-    """Resolve effective concurrency from node and pipeline configs.
+    """Resolve effective concurrency from pod and pipeline configs.
 
     Returns:
         The concurrency limit to use, or ``None`` for unlimited.
@@ -329,8 +414,8 @@ def resolve_concurrency(
     Raises:
         ValueError: If the resolved value is ``<= 0``.
     """
-    if node_config.max_concurrency is not None:
-        result = node_config.max_concurrency
+    if pod_config.max_concurrency is not None:
+        result = pod_config.max_concurrency
     else:
         result = pipeline_config.default_max_concurrency
     if result is not None and result <= 0:
@@ -557,6 +642,46 @@ class ContentHash:
             return f"{self.method}:{self.to_hex(hexdigits)}"
         return self.to_hex(hexdigits)
 
+    def to_prefixed_digest(self) -> bytes:
+        """Return the hash as method-prefixed raw bytes: ``b"{method}:{digest}"``.
+
+        Encodes the method name as ASCII, appends a literal ``:`` byte, then
+        appends the raw digest bytes.  The result is suitable for storage in a
+        ``pa.large_binary()`` column and preserves the hash method for
+        introspection without the hex-encoding overhead of ``to_string()``.
+
+        Example::
+
+            h = ContentHash("arrow_v2.1", b"\\x00" * 32)
+            h.to_prefixed_digest()
+            # b"arrow_v2.1:\\x00\\x00...\\x00"
+
+        Returns:
+            Raw bytes in the form ``b"{method}:{raw_digest}"``.
+        """
+        return self.method.encode("ascii") + b":" + self.digest
+
+    @classmethod
+    def from_prefixed_digest(cls, data: bytes) -> "ContentHash":
+        """Parse method-prefixed raw bytes back into a ``ContentHash``.
+
+        Inverse of ``to_prefixed_digest()``.
+
+        Args:
+            data: Bytes in the form ``b"{method}:{raw_digest}"``, as
+                produced by ``to_prefixed_digest()``.
+
+        Returns:
+            A new ``ContentHash`` instance.
+
+        Raises:
+            ValueError: If ``data`` does not contain a colon separator.
+        """
+        colon_idx = data.index(b":")
+        method = data[:colon_idx].decode("ascii")
+        digest = data[colon_idx + 1:]
+        return cls(method=method, digest=digest)
+
     def __str__(self) -> str:
         return self.to_string()
 
@@ -584,3 +709,89 @@ class ContentHash:
             A string like ``"arrow_v2.1:1a2b3c4d"``.
         """
         return f"{self.method}:{self.to_hex(length)}"
+
+
+@dataclass
+class Cursor(Generic[_T]):
+    """Marks the current position in a DynamicSource's data stream.
+
+    Args:
+        value: Implementation-defined cursor value. May be a datetime
+            timestamp, integer offset, string pagination token, or any
+            other type meaningful to the implementation.
+        modified_at: Optional wall-clock time when the source content at
+            this cursor position was last modified. When provided,
+            ``PollingSource`` uses this to update its ``last_modified``
+            timestamp for downstream staleness detection. When ``None``,
+            the framework falls back to its own wall clock.
+    """
+
+    value: _T
+    modified_at: datetime | None = None
+
+    @classmethod
+    def now(cls, value: _T) -> Cursor[_T]:
+        """Create a cursor whose ``modified_at`` is the current UTC wall time.
+
+        Args:
+            value: The cursor position value.
+
+        Returns:
+            A new ``Cursor`` with ``modified_at`` set to
+            ``datetime.now(tz=timezone.utc)``.
+        """
+        from datetime import timezone
+
+        return cls(value=value, modified_at=datetime.now(tz=timezone.utc))
+
+
+@dataclass(frozen=True, slots=True)
+class PollingConfig:
+    """Configuration for a ``PollingSource``.
+
+    Args:
+        interval: Seconds between ``poll()`` calls, measured start-to-start.
+        duration: Total seconds to run. ``0`` means indefinite (run until
+            cancelled).
+        max_missed_intervals: Maximum consecutive tick windows consumed by a
+            single poll+fetch cycle before the source terminates.
+            Resets to zero on any clean tick.
+        max_consecutive_errors: Maximum consecutive ``poll()``/``fetch()``
+            failures before the source closes its channel cleanly.
+        error_backoff_base: Base wait in seconds for exponential backoff on
+            errors. Wait after the nth error is
+            ``error_backoff_base * 2 ** (n - 1)``.
+    """
+
+    interval: float = 1.0
+    duration: float = 0.0
+    max_missed_intervals: int = 5
+    max_consecutive_errors: int = 3
+    error_backoff_base: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.interval <= 0:
+            raise ValueError(
+                f"PollingConfig.interval must be > 0, got {self.interval}"
+            )
+        if self.duration < 0:
+            raise ValueError(
+                f"PollingConfig.duration must be >= 0, got {self.duration}"
+            )
+        if self.max_missed_intervals < 1:
+            raise ValueError(
+                f"PollingConfig.max_missed_intervals must be >= 1, "
+                f"got {self.max_missed_intervals}"
+            )
+        if self.max_consecutive_errors < 1:
+            raise ValueError(
+                f"PollingConfig.max_consecutive_errors must be >= 1, "
+                f"got {self.max_consecutive_errors}"
+            )
+        if self.error_backoff_base <= 0:
+            raise ValueError(
+                f"PollingConfig.error_backoff_base must be > 0, "
+                f"got {self.error_backoff_base}"
+            )
+
+

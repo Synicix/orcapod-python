@@ -16,6 +16,7 @@ import itertools
 import logging
 import re
 import threading
+import uuid
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -74,13 +75,13 @@ def _pg_type_to_arrow(pg_type_name: str, udt_name: str) -> pa.DataType:
         return _pa.float32()
     if t in ("float8", "double precision", "numeric", "decimal"):
         return _pa.float64()
+    if t == "uuid":
+        return _pa.binary(16)
+
     if t in ("text", "varchar", "character varying", "char", "bpchar",
-             "name", "uuid", "json", "jsonb", "time", "timetz"):
+             "name", "json", "jsonb", "time", "timetz"):
         if t in ("time", "timetz"):
             logger.warning("PostgreSQL type %r mapped to pa.large_string() (known gap)", t)
-        if t == "uuid":
-            # TODO: revisit mapping once PLT-1162 decides on a canonical UUID Arrow type
-            pass
         return _pa.large_string()
     if t == "bytea":
         return _pa.large_binary()
@@ -150,6 +151,26 @@ def _arrow_type_to_pg_sql(arrow_type: pa.DataType) -> str:
     return "TEXT"
 
 
+def _coerce_pg_value(value: Any, arrow_type: "pa.DataType") -> Any:
+    """Coerce a psycopg driver value to match the target Arrow type.
+
+    Args:
+        value: Raw value from the psycopg cursor.
+        arrow_type: The Arrow type the value will be stored as.
+
+    Returns:
+        A Python value compatible with ``pa.array(..., type=arrow_type)``.
+    """
+    import pyarrow as _pa
+
+    if value is None:
+        return None
+    # psycopg returns uuid columns as uuid.UUID objects; binary(16) needs raw bytes
+    if arrow_type == _pa.binary(16) and isinstance(value, uuid.UUID):
+        return value.bytes
+    return value
+
+
 def _resolve_column_type_lookup(
     query: str,
     connector: "PostgreSQLConnector",
@@ -204,6 +225,37 @@ def _resolve_column_type_lookup(
         return {}
 
     return {ci.name: ci.arrow_type for ci in connector.get_column_info(table_name)}
+
+
+def _field_has_metadata(field: pa.Field) -> bool:
+    """Return True if ``field`` or any nested child carries Arrow metadata.
+
+    Recursively walks struct and list type trees so that metadata on child
+    fields is detected and not silently dropped.
+
+    Args:
+        field: The Arrow field to inspect.
+
+    Returns:
+        True if the field or any descendant carries field metadata or is an
+        Arrow extension type; False otherwise.
+    """
+    import pyarrow as _pa  # noqa: PLC0415
+
+    if isinstance(field.type, _pa.ExtensionType) or field.metadata:
+        return True
+    if _pa.types.is_struct(field.type):
+        return any(
+            _field_has_metadata(field.type.field(i))
+            for i in range(field.type.num_fields)
+        )
+    if (
+        _pa.types.is_list(field.type)
+        or _pa.types.is_large_list(field.type)
+        or _pa.types.is_fixed_size_list(field.type)
+    ):
+        return _field_has_metadata(field.type.value_field)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +412,7 @@ class PostgreSQLConnector:
 
             while rows:
                 arrays = [
-                    _pa.array([r[i] for r in rows], type=t)
+                    _pa.array([_coerce_pg_value(r[i], t) for r in rows], type=t)
                     for i, t in enumerate(arrow_types)
                 ]
                 yield _pa.RecordBatch.from_arrays(arrays, schema=schema)
@@ -452,6 +504,36 @@ class PostgreSQLConnector:
             except Exception:
                 conn.rollback()
                 raise
+
+    def validate_records(self, records: pa.Table) -> None:
+        """Reject tables carrying any Arrow field or schema metadata.
+
+        ``PostgreSQLConnector`` does not preserve Arrow field or schema metadata
+        across read/write cycles — any metadata present would be silently lost.
+        This includes Arrow extension types, which encode their identity in field
+        metadata and would be demoted to their plain storage type on read.
+        Nested field metadata (inside struct or list columns) is also detected.
+
+        Args:
+            records: Arrow table to validate.
+
+        Raises:
+            ValueError: If any field (or any nested child field) carries
+                metadata, or if the schema itself carries metadata.
+        """
+        problem_fields = [f.name for f in records.schema if _field_has_metadata(f)]
+        has_schema_meta = bool(records.schema.metadata)
+        if problem_fields or has_schema_meta:
+            parts: list[str] = []
+            if problem_fields:
+                fields_str = ", ".join(repr(n) for n in problem_fields)
+                parts.append(f"fields with metadata: {fields_str}")
+            if has_schema_meta:
+                parts.append("schema-level metadata")
+            raise ValueError(
+                f"PostgreSQLConnector does not preserve Arrow metadata "
+                f"({', '.join(parts)})."
+            )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

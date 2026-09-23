@@ -5,11 +5,12 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 from orcapod import contexts
-from orcapod.config import Config
+from orcapod.config import OrcapodConfig
 from orcapod.core.sources.base import RootSource
 from orcapod.core.streams.arrow_table_stream import ArrowTableStream
 from orcapod.protocols.core_protocols import DataProtocol, SourceProtocol, TagProtocol
 from orcapod.protocols.database_protocols import ArrowDatabaseProtocol
+from orcapod.system_constants import constants
 from orcapod.types import ColumnConfig, Schema
 from orcapod.utils.lazy_module import LazyModule
 
@@ -59,7 +60,7 @@ class CachedSource(RootSource):
         source_id: str | None = None,
         label: str | None = None,
         data_context: str | contexts.DataContext | None = None,
-        config: Config | None = None,
+        config: OrcapodConfig | None = None,
     ) -> None:
         if data_context is None:
             data_context = source.data_context_key
@@ -219,7 +220,11 @@ class CachedSource(RootSource):
             columns={"source": True, "system_tags": True}
         )
 
-        # Compute per-row record hashes for dedup: hash(full row)
+        # Compute per-row record hashes for dedup: hash the full row including
+        # all system tag columns.  The record_id system tag encodes row origin
+        # (source_id + provenance token), so two rows that are byte-identical in
+        # their data columns but originate from different positions in the source
+        # will have different record_ids and must be stored as distinct entries.
         arrow_hasher = self.data_context.arrow_hasher
         record_hashes: list[str] = []
         for batch in live_table.to_batches():
@@ -232,7 +237,7 @@ class CachedSource(RootSource):
         live_with_hash = live_table.add_column(
             0,
             self.HASH_COLUMN_NAME,
-            pa.array(record_hashes, type=pa.large_string()),
+            pa.array([h.encode() for h in record_hashes], type=pa.large_binary()),
         )
         self._cache_database.add_records(
             self.cache_path,
